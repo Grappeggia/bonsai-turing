@@ -84,6 +84,8 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    llama_token get_gpu_argmax_ith(int32_t i);
+    void materialize_deferred_logits();
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -148,7 +150,7 @@ struct llama_context {
 
     // ARC-LAB: chained MTP drafts (llama-ext.h llama_mtp_chain_support / llama_set_mtp_chain / llama_get_mtp_chain_ids)
     int32_t         mtp_chain_support() const;
-    void            set_mtp_chain(uint32_t n_steps);
+    void            set_mtp_chain(uint32_t n_steps, uint32_t n_seqs = 1);
     const int32_t * get_mtp_chain_ids();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -401,6 +403,15 @@ private:
     };
 
     std::vector<swap_info> output_swaps;
+
+    // Zero-copy GPU greedy argmax fast path (avoids copying 64..512 MB logits DtoH + CPU row swaps)
+    std::vector<llama_token> gpu_argmax_ids;
+    bool                     gpu_argmax_valid        = false;
+    bool                     logits_deferred         = false;
+    ggml_backend_t           logits_deferred_backend = nullptr;
+    const ggml_tensor *      logits_deferred_tensor  = nullptr;
+    size_t                   logits_deferred_nbytes  = 0;
+    std::vector<swap_info>   logits_deferred_swaps;
 
     ggml_backend_sched_ptr sched;
 

@@ -116,6 +116,7 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // llama_get_mtp_chain_ids: after that decode, the n greedy draft tokens (synchronizes), or nullptr.
 LLAMA_API int32_t             llama_mtp_chain_support(const struct llama_context * ctx);
 LLAMA_API void                llama_set_mtp_chain    (struct llama_context * ctx, int32_t n_steps);
+LLAMA_API void                llama_set_mtp_chain_seqs(struct llama_context * ctx, int32_t n_steps, int32_t n_seqs);
 LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx);
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details

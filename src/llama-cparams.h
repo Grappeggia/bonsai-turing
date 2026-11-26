@@ -24,7 +24,8 @@ struct llama_cparams {
     int32_t  nextn_layer_offset = 0;
 
     // ARC-LAB: > 0: the next DECODER_MTP graph drafts this many tokens in one graph (llama_set_mtp_chain)
-    uint32_t mtp_chain_n = 0;
+    uint32_t mtp_chain_n     = 0;
+    uint32_t mtp_chain_n_seq = 1;
 
     float rope_freq_base;
     float rope_freq_scale;

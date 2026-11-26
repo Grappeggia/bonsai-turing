@@ -366,14 +366,24 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
 
-    // Apply Q normalization
+    // Apply Q normalization + MRoPE back-to-back so CUDA RMS_NORM+MUL+ROPE fusion fires!
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
+    Qcur = ggml_rope_multi(
+            ctx0, Qcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
 
-    // Apply K normalization
+    // Apply K normalization + MRoPE back-to-back so CUDA RMS_NORM+MUL+ROPE fusion fires!
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
 
     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -383,19 +393,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-
-    // Apply MRoPE
-    Qcur = ggml_rope_multi(
-            ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
-
-    Kcur = ggml_rope_multi(
-            ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
@@ -512,8 +509,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * state;
     if (gdn_rpl) {
-        state = build_rs(ssm_states_all, inp->s_rpl_main, inp->s_rpl_extra, hparams.n_embd_s(), n_seqs,
-                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+        if (inp->rpl_identity) {
+            state = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                    ssm_states_all->nb[1], (size_t) mctx_cur->get_head() * ssm_states_all->nb[1]);
+        } else {
+            state = build_rs(ssm_states_all, inp->s_rpl_main, inp->s_rpl_extra, hparams.n_embd_s(), n_seqs,
+                    mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+        }
         state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
         cb(state, "state_predelta", il);
     } else if (gdn_state_rows) {
@@ -646,8 +648,9 @@ public:
     };
     std::vector<step> steps;
     int64_t       n_tokens = 0;
+    int64_t       n_seqs   = 1;
     ggml_tensor * pos      = nullptr; // I32 [n_tokens * n_pos_per_embd]
-    ggml_tensor * out_idx  = nullptr; // I32 [gathering steps]: nr - 1 (the step's last row produces its draft); null: none
+    ggml_tensor * out_idx  = nullptr; // I32 [gathering steps * n_seqs]: anchor row indices; null: none
     bool          out_in_pos = false; // the output rows follow the positions in pos (one upload), out_idx unused
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -672,7 +675,22 @@ public:
             }
             off += (size_t) st.nr * n_pos_per_embd;
             if (st.gather) {
-                o.push_back((int32_t) st.nr - 1);
+                if (n_seqs == 1) {
+                    o.push_back((int32_t) st.nr - 1);
+                } else if (s == 0 && ubatch->output) {
+                    int64_t found = 0;
+                    for (int64_t r = 0; r < st.nr; ++r) {
+                        if (ubatch->output[st.r0 + r]) {
+                            o.push_back((int32_t) r);
+                            found++;
+                        }
+                    }
+                    GGML_ASSERT(found == n_seqs);
+                } else {
+                    for (int64_t r = 0; r < n_seqs; ++r) {
+                        o.push_back((int32_t) (st.nr - n_seqs + r));
+                    }
+                }
             }
         }
         if (out_in_pos) {
@@ -687,7 +705,8 @@ public:
     // reusable when the batch has the same rows and every step would attend over the same KV length (the rest of the
     // topology is checked by allow_reuse and the other inputs)
     bool can_reuse(const llm_graph_params & params) override {
-        if (params.ubatch.n_tokens != n_tokens || params.cparams.mtp_chain_n != steps.size()) {
+        if (params.ubatch.n_tokens != n_tokens || params.cparams.mtp_chain_n != steps.size() ||
+            (int64_t) std::max<uint32_t>(1, params.cparams.mtp_chain_n_seq) != n_seqs) {
             return false;
         }
         const auto * kvc = static_cast<const llama_kv_cache_context *>(params.mctx);
@@ -934,6 +953,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     static const bool draft_head_off = getenv("LLAMA_MTP_DRAFT_HEAD_OFF") != nullptr;
+    static const int64_t draft_vocab = []() -> int64_t {
+        const char * v = getenv("LLAMA_MTP_DRAFT_VOCAB");
+        return v ? atoll(v) : 0;
+    }();
     if (layer.nextn.draft_head && layer.nextn.draft_head_ids && !layer.nextn.shared_head_head && !draft_head_off) {
         // ARC-LAB: logits for the top-K frequent tokens only, scattered into a full-vocab row of -inf; the target
         // model still verifies every draft, so this changes only which tokens can be drafted, not the output
@@ -946,6 +969,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, lk, 1, n_k, n_out),
                              ggml_reshape_2d(ctx0, layer.nextn.draft_head_ids, n_k, 1));
         cur = ggml_reshape_2d(ctx0, full, n_voc, n_out);
+    } else if (draft_vocab > 0 && draft_vocab < head_w->ne[1] && !draft_head_off) {
+        const int64_t n_k   = draft_vocab;
+        const int64_t n_out = cur->ne[1];
+        const int64_t n_voc = head_w->ne[1];
+        ggml_tensor * cur_mm   = build_hadamard_input(head_w, cur);
+        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_k, head_w->nb[1], 0);
+        ggml_tensor * lk       = ggml_mul_mat(ctx0, head_sub, cur_mm);
+        if (head_s) {
+            lk = ggml_mul(ctx0, lk, head_s);
+        }
+        ggml_tensor * tail     = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_voc - n_k, n_out), -INFINITY);
+        cur = ggml_concat(ctx0, lk, tail, 0);
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }
@@ -970,9 +1005,10 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     const auto &  layer       = model.layers[il];
 
     const int64_t n_steps = cparams.mtp_chain_n;
-    GGML_ASSERT(n_steps >= 1 && n_tokens >= n_steps);
-    GGML_ASSERT(ubatch.token && ubatch.embd && "MTP chain needs tokens and hidden rows");
-    const int64_t n_lead = n_tokens - n_steps + 1;  // step 0: catch-up rows + the anchor
+    const int64_t n_seq_c = std::max<int64_t>(1, cparams.mtp_chain_n_seq);
+    GGML_ASSERT(n_steps >= 1 && n_tokens >= n_steps * n_seq_c);
+    GGML_ASSERT(ubatch.token && ubatch.embd_state && "MTP chain needs tokens and hidden rows");
+    const int64_t n_lead = n_tokens - (n_steps - 1) * n_seq_c;  // step 0: catch-up rows + anchors
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -1014,14 +1050,15 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     const uint32_t n_pos = hparams.n_pos_per_embd();
     auto chain_inp = std::make_unique<llm_graph_input_mtp_chain>(n_pos);
     chain_inp->n_tokens = n_tokens;
+    chain_inp->n_seqs   = n_seq_c;
     int64_t n_gather = 0;
     for (int64_t s = 0; s < n_steps; ++s) {
         llm_graph_input_mtp_chain::step st;
-        st.r0     = s == 0 ? 0 : n_lead - 1 + s;
-        st.nr     = s == 0 ? n_lead : 1;
+        st.r0     = s == 0 ? 0 : n_lead + (s - 1) * n_seq_c;
+        st.nr     = s == 0 ? n_lead : n_seq_c;
         st.n_kv   = kvc->get_n_kv_prefix((uint32_t) (st.r0 + st.nr));
-        st.gather = !(tight & 4) || st.nr > 1;
-        n_gather += st.gather;
+        st.gather = !(tight & 4) || st.nr > n_seq_c;
+        n_gather += st.gather ? n_seq_c : 0;
         chain_inp->steps.push_back(st);
     }
     chain_inp->out_in_pos = (tight & 8) && n_gather > 0;
@@ -1132,7 +1169,7 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
         const int64_t nr = st.nr;
         auto &        si = sin[s];
         si.pos     = ggml_view_1d(ctx0, pos_all, nr * n_pos, st.r0 * n_pos * ggml_element_size(pos_all));
-        si.out     = !st.gather ? nullptr : n_gather == 1 ? out_all : ggml_view_1d(ctx0, out_all, 1, g++ * ggml_element_size(out_all));
+        si.out     = !st.gather ? nullptr : n_gather == n_seq_c ? out_all : ggml_view_1d(ctx0, out_all, n_seq_c, (g++) * n_seq_c * ggml_element_size(out_all));
         si.k_idxs  = ggml_view_1d(ctx0, k_all, nr, st.r0 * ggml_element_size(k_all));
         si.v_idxs  = ggml_view_1d(ctx0, v_all, nr, st.r0 * ggml_element_size(v_all));
         si.kq_mask = ggml_view_2d(ctx0, mask_all, st.n_kv, nr, mask_all->nb[1], st.r0 * mask_all->nb[1]);
@@ -1271,8 +1308,23 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
 
         // greedy draft: argmax of the head's logits. With a draft head that is an index into its vocabulary (the
         // -inf scatter of the single-step graph only maps it to a token id, which the context does on the host)
-        ggml_tensor * logits = use_draft_head ? build_lora_mm(layer.nextn.draft_head, h_out, nullptr)
-                                              : build_lora_mm(head_w, h_out, head_s);
+        static const int64_t draft_vocab = []() -> int64_t {
+            const char * v = getenv("LLAMA_MTP_DRAFT_VOCAB");
+            return v ? atoll(v) : 0;
+        }();
+        ggml_tensor * logits;
+        if (use_draft_head) {
+            logits = build_lora_mm(layer.nextn.draft_head, h_out, nullptr);
+        } else if (draft_vocab > 0 && draft_vocab < head_w->ne[1]) {
+            ggml_tensor * cur_mm   = build_hadamard_input(head_w, h_out);
+            ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
+            logits = ggml_mul_mat(ctx0, head_sub, cur_mm);
+            if (head_s) {
+                logits = ggml_mul(ctx0, logits, head_s);
+            }
+        } else {
+            logits = build_lora_mm(head_w, h_out, head_s);
+        }
         cb(logits, "result_output", -1);
         ggml_tensor * best = ggml_argmax(ctx0, logits);
         ggml_set_name(best, "mtp_chain_argmax");
@@ -1292,8 +1344,10 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
             e = ggml_get_rows(ctx0, mtp_chain_embd, best);
         } else if (use_draft_head) {
             ggml_tensor * ids = layer.nextn.draft_head_ids;
-            ggml_tensor * tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ids, 1, ids->ne[0]), best);  // I32 [1, 1]
-            e = ggml_get_rows(ctx0, tok_embd_w, ggml_reshape_1d(ctx0, tok, 1));
+            ggml_tensor * tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ids, 1, ids->ne[0]), best);  // I32 [1, n_seq_c]
+            e = ggml_get_rows(ctx0, tok_embd_w, ggml_reshape_1d(ctx0, tok, n_seq_c));
+        } else if (mtp_chain_embd) {
+            e = ggml_get_rows(ctx0, mtp_chain_embd, best);
         } else {
             e = ggml_get_rows(ctx0, tok_embd_w, best);
         }

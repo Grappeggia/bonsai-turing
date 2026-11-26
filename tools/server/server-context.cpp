@@ -3435,26 +3435,25 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
-#ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
         int64_t & n;
         int64_t t_start;
-        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
+        bool active;
+        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_), t_start(0) {
+            static const bool on = getenv("LLAMA_SRV_TIMING") != nullptr;
+            active = on;
+            if (active) {
+                t_start = ggml_time_us();
+            }
         }
         ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
+            if (active) {
+                t += ggml_time_us() - t_start;
+                n++;
+            }
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     // fill slot.inp_embd with the next rows of the audio stream
     // returns false if the slot has nothing to decode now
@@ -3506,18 +3505,19 @@ private:
     }
 
     void update_slots() {
-#ifdef DEBUG_TIMINGS
-        static int64_t t_prev = 0;
-        int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
-            t_prev = t_start;
-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+        static const bool dbg_timings = getenv("LLAMA_SRV_TIMING") != nullptr;
+        if (dbg_timings) {
+            static int64_t t_prev = 0;
+            int64_t t_start = ggml_time_us();
+            if (t_start - t_prev > 2 * 1000 * 1000 && n_decode > 0) {
+                t_prev = t_start;
+                fprintf(stderr, "TIMING: n_pre=%" PRId64 " pre=%.2fms | n_dec=%" PRId64 " dec=%.2fms | n_post=%" PRId64 " post=%.2fms | n_smpl=%" PRId64 " smpl=%.2fms\n",
+                    n_pre_decode, n_pre_decode ? (double) t_pre_decode / n_pre_decode / 1000.0 : 0.0,
+                    n_decode,     n_decode     ? (double) t_decode     / n_decode     / 1000.0 : 0.0,
+                    n_post_decode,n_post_decode? (double) t_post_decode/ n_post_decode/ 1000.0 : 0.0,
+                    n_sampl,      n_sampl      ? (double) t_sampl      / n_sampl      / 1000.0 : 0.0);
+            }
         }
-#endif
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop

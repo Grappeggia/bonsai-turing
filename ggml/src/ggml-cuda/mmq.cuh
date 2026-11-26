@@ -1584,18 +1584,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // Yukon cuda.fast Bonsai engine): same work partition, same fixup, same FP32 order. Default on for Hopper,
     // GGML_CUDA_PQ2_J128=0/1 overrides.
     if constexpr ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) && J == 128 && !fallback) {
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && (type == GGML_TYPE_PTQ1_0 ? ggml_cuda_ptq1_j128_enabled(cc) : ggml_cuda_pq2_j128_enabled(cc)) && cc >= GGML_CUDA_CC_HOPPER && warp_size == 32 &&
-                ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_HOPPER &&
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && (type == GGML_TYPE_PTQ1_0 ? ggml_cuda_ptq1_j128_enabled(cc) : ggml_cuda_pq2_j128_enabled(cc)) && cc >= GGML_CUDA_CC_TURING && warp_size == 32 &&
+                ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING &&
                 ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).I == 128 && ggml_cuda_mmq_get_stream_k(type, J, fallback, cc, prec_src1) &&
                 ggml_cuda_mmq_pq2_j128_use(args, nsm)) {
-            const int grid = ggml_cuda_mmq_pq2_j128_grid(args, nsm);
+            const int grid = ggml_cuda_mmq_pq2_j128_grid(args, nsm, cc);
             ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id));
             if (ggml_cuda_mmq_pq2_j128_needs_fixup(args, grid)) {
                 tmp_fixup.alloc((size_t) grid*128*128);
             }
             static bool logged = false;
             if (!logged) {
-                GGML_LOG_INFO("%s: J128: using the %s J=128 sm_90+ kernel\n", __func__, ggml_type_name(type));
+                GGML_LOG_INFO("%s: J128: using the %s J=128 Turing/sm_90+ kernel\n", __func__, ggml_type_name(type));
                 logged = true;
             }
             ggml_cuda_mmq_pq2_j128_run<type>(args, grid, tmp_fixup.ptr, stream);

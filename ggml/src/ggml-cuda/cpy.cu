@@ -652,11 +652,39 @@ static __global__ void cpy_f32_batched(const ggml_cuda_cpy_batch batch, const in
     *(float *) (batch.dst[blockIdx.y] + dst_offset) = *(const float *) (batch.src[blockIdx.y] + x_offset);
 }
 
+static __global__ void cpy_f32_batched_conv3(
+        const ggml_cuda_cpy_batch batch, const int n, const int C,
+        const int64_t nb01, const int64_t nb02, const int64_t nb11) {
+    const int ch  = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    const int seq = (int) blockIdx.y;
+    if (ch >= C) { return; }
+    const int64_t s_off = (int64_t) seq * nb02 + (int64_t) ch * nb01;
+    const int64_t d_seq = (int64_t) seq * nb11;
+    const int     d_ch  = ch * 3;
+    for (int b = 0; b < n; ++b) {
+        const float * s = (const float *) (batch.src[b] + s_off);
+        float       * d = (float *) (batch.dst[b] + d_seq) + d_ch;
+        d[0] = s[0];
+        d[1] = s[1];
+        d[2] = s[2];
+    }
+}
+
 void ggml_cuda_cpy_f32_batched(ggml_backend_cuda_context & ctx, const ggml_tensor * src_ref, const ggml_tensor * dst_ref,
                                const ggml_cuda_cpy_batch & batch, const int n) {
     GGML_ASSERT(n >= 1 && n <= CUDA_CPY_BATCH_MAX);
     const int64_t ne = ggml_nelements(src_ref);
     GGML_ASSERT(ne == ggml_nelements(dst_ref) && ne <= INT_MAX);
+
+    if (src_ref->ne[0] == 3 && src_ref->ne[3] == 1 && dst_ref->ne[2] == 1 && dst_ref->ne[3] == 1 &&
+            src_ref->nb[0] == sizeof(float) && dst_ref->nb[0] == sizeof(float) &&
+            dst_ref->ne[0] == 3 * src_ref->ne[1] && dst_ref->ne[1] == src_ref->ne[2]) {
+        const int C = (int) src_ref->ne[1];
+        const dim3 grid((unsigned) ((C + 255) / 256), (unsigned) src_ref->ne[2], 1);
+        cpy_f32_batched_conv3<<<grid, 256, 0, ctx.stream()>>>(
+            batch, n, C, (int64_t) src_ref->nb[1], (int64_t) src_ref->nb[2], (int64_t) dst_ref->nb[1]);
+        return;
+    }
 
     const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params(dim3(num_blocks, n, 1), dim3(CUDA_CPY_BLOCK_SIZE, 1, 1), 0, ctx.stream());

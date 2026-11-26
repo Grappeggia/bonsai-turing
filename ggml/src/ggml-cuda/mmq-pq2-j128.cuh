@@ -51,6 +51,36 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_mma(int (&d)[4], const
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %10, %10, %10};"
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(m));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && !defined(GGML_USE_HIP)
+    const int m = GGML_CUDA_PQ2_J128_MAGIC;
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %4};"
+        : "=r"(d[0]), "=r"(d[1]) : "r"(a[0]), "r"(b0), "r"(m));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %4};"
+        : "=r"(d[2]), "=r"(d[3]) : "r"(a[1]), "r"(b0), "r"(m));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[0]), "+r"(d[1]) : "r"(a[2]), "r"(b1));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[2]), "+r"(d[3]) : "r"(a[3]), "r"(b1));
+#else
+    GGML_UNUSED_VARS(d, a, b0, b1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_pq2_j128_mma_acc(int (&d)[4], const int (&a)[4], const int b0, const int b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE && !defined(GGML_USE_HIP)
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && !defined(GGML_USE_HIP)
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(b0));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[2]), "+r"(d[3]) : "r"(a[1]), "r"(b0));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[0]), "+r"(d[1]) : "r"(a[2]), "r"(b1));
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+        : "+r"(d[2]), "+r"(d[3]) : "r"(a[3]), "r"(b1));
 #else
     GGML_UNUSED_VARS(d, a, b0, b1);
     NO_DEVICE_CODE;
@@ -282,7 +312,12 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_yload(const uint32_t d
     for (int c0 = 0; c0 < nchunks; c0 += G) {
         const int c = c0 + m;
         if (c0 + G <= nchunks || c < nchunks) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE && !defined(GGML_USE_HIP)
             cp_async_cg_16<256>(dst + 16*c, src + 16*c);
+#else
+            const uint4 v = *reinterpret_cast<const uint4 *>(src + 16*c);
+            ggml_cuda_pq2_j128_sts_v4(dst + 16*c, (int) v.x, (int) v.y, (int) v.z, (int) v.w);
+#endif
         }
     }
 }
@@ -411,7 +446,63 @@ static __device__ __forceinline__ void ggml_cuda_pq2_ws_compute_compact(float (&
     }
 }
 
-// (D1 compute not ported: prism has no D1 activation producer.)
+// D1 compute: 1 scale per 128 activations (d4[0] == d4[1] == d4[2] == d4[3]).
+// Accumulates all 4 K sub-blocks (128 elements) in INT32 on Tensor Cores, then rescales ONCE (4x fewer FP32 FFMAs + 4x fewer dB LDS).
+static __device__ __forceinline__ void ggml_cuda_pq2_j128_compute_d1(float (&acc)[2][4][4], const uint32_t xs, const uint32_t ys) {
+    const int lane = threadIdx.x;
+    const int g    = lane / 4;
+    const int c    = lane % 4;
+    constexpr int XS = 4*ggml_cuda_pq2_j128_xs;
+    constexpr int YS = 4*ggml_cuda_pq2_j128_ys;
+    const uint32_t xa = xs + (lane % 16)*XS + (lane / 16)*16;
+    const uint32_t ya = ys + (lane % 8)*YS + 16 + ((lane / 8) % 2)*16;
+    const uint32_t xd = xs + g*XS + 4*32;
+    const uint32_t yd = ys + 2*c*YS;
+
+    float dA[2][2], ndA[2][2];
+#pragma unroll
+    for (int rt = 0; rt < 2; ++rt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            dA [rt][h] = ggml_cuda_pq2_j128_lds_f32(xd + (rt*16 + 8*h)*XS);
+            ndA[rt][h] = -12582912.0f*dA[rt][h];
+        }
+    }
+    float dB[4][2];
+#pragma unroll
+    for (int ct = 0; ct < 4; ++ct) {
+        dB[ct][0] = ggml_cuda_pq2_j128_lds_f32(yd + ct*8*YS);
+        dB[ct][1] = ggml_cuda_pq2_j128_lds_f32(yd + ct*8*YS + YS);
+    }
+
+#pragma unroll
+    for (int rt = 0; rt < 2; ++rt) {
+        int C[4][4];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            int A[4];
+            ggml_cuda_pq2_j128_ldsm_x4(A, xa + rt*16*XS + s*32);
+#pragma unroll
+            for (int ct = 0; ct < 4; ++ct) {
+                int B[2];
+                ggml_cuda_pq2_j128_ldsm_x2(B, ya + ct*8*YS + s*32);
+                if (s == 0) {
+                    ggml_cuda_pq2_j128_mma(C[ct], A, B[0], B[1]);
+                } else {
+                    ggml_cuda_pq2_j128_mma_acc(C[ct], A, B[0], B[1]);
+                }
+            }
+        }
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const float t = __fmaf_rn(__int_as_float(C[ct][l]), dA[rt][l/2], ndA[rt][l/2]);
+                acc[rt][ct][l] = __fmaf_rn(t, dB[ct][l%2], acc[rt][ct][l]);
+            }
+        }
+    }
+}
 
 template <bool PURE, bool COMPACT = false, bool D1 = false, ggml_type XT = GGML_TYPE_PQ2_0>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
@@ -436,19 +527,55 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
     const char * xblk = x + ((int64_t) (row0 + tid/4)*stride_row_x + kb_start)*BS;
     const int hint_off = kq == 1 ? BS - 1 : 0; // lanes kq 0/1 hint the first/last byte of the block
     const bool hint_lane = kq < 2;
-    const uint32_t xst = smem + 2*YBYTES + (tid/4)*XS + kq*32; // X tile store address
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+    constexpr uint32_t NY = 1;
+#else
+    constexpr uint32_t NY = 2;
+#endif
+    const uint32_t xst = smem + NY*YBYTES + (tid/4)*XS + kq*32; // X tile store address
 
     const int64_t y_kb_bytes = (int64_t) ncols_y*YS;
     const char * yb = (const char *) y + kb_start*y_kb_bytes + (int64_t) (col0 + wc*32)*YS; // column group's records
     const uint32_t ycp = smem + wc*32*YS; // column group's records in Y buffer 0
 
-    const uint32_t xw = smem + 2*YBYTES + wr*32*XS; // warp's X rows
-    const uint32_t yw = smem + wc*32*YS;            // warp's Y columns (buffer 0)
+    const uint32_t xw = smem + NY*YBYTES + wr*32*XS; // warp's X rows
+    const uint32_t yw = smem + wc*32*YS;             // warp's Y columns (buffer 0)
 
     if constexpr (PURE) {
         GGML_UNUSED(ph);
         ggml_cuda_pq2_j128_xraw xr;
-
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+        // Turing sm_75: single-buffered Y (27 KB/CTA -> 2 CTAs/SM = 16 warps/SM in 64 KB smem).
+        ggml_cuda_j128_xload<XT>(xr, xblk, kq);
+        __syncthreads();
+        ggml_cuda_pq2_j128_yload<G>(ycp, yb, m);
+        ggml_cuda_j128_xstore<XT>(xr, xst, kq);
+        if (kb_start + 1 < kb_stop) {
+            xblk += BS;
+            ggml_cuda_j128_xload<XT>(xr, xblk, kq);
+        }
+        __syncthreads();
+        for (int kb = kb_start; kb < kb_stop; ++kb) {
+            if (hint_lane && kb + HINT_D < kb_stop) {
+                ggml_cuda_pq2_j128_hint(xblk + (HINT_D - 1)*BS + hint_off);
+            }
+            if constexpr (D1) ggml_cuda_pq2_j128_compute_d1(acc, xw, yw);
+            else if constexpr (COMPACT) ggml_cuda_pq2_ws_compute_compact<false>(acc, xw, yw);
+            else ggml_cuda_pq2_j128_compute<false>(acc, xw, yw);
+            if (kb + 1 >= kb_stop) {
+                break;
+            }
+            __syncthreads();
+            yb += y_kb_bytes;
+            ggml_cuda_pq2_j128_yload<G>(ycp, yb, m);
+            ggml_cuda_j128_xstore<XT>(xr, xst, kq);
+            if (kb + 2 < kb_stop) {
+                xblk += BS;
+                ggml_cuda_j128_xload<XT>(xr, xblk, kq);
+            }
+            __syncthreads();
+        }
+#else
         // prologue: block kb_start (the global X words are read before the barrier: registers only)
         ggml_cuda_j128_xload<XT>(xr, xblk, kq);
         __syncthreads(); // the previous segment's last compute no longer reads any tile
@@ -492,7 +619,9 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             }
             __syncthreads(); // X tile (block kb+1) and Y buffer `cur ^ 1` complete
         }
+#endif
     } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
         // Y through one bulk copy (TMA) per K block; after it lands, the D4 headers of the 128 columns are
         // transposed by threads 0..127 into dBT[buf][s][col] (2 KB per buffer) so that a lane reads the
         // scales of its two columns with one 8-byte load. mbarriers live in the padding of X row 0.
@@ -561,6 +690,9 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             __syncthreads(); // X tile (block kb+1) and dBT `cur ^ 1` complete
         }
         GGML_UNUSED(ycp); GGML_UNUSED(m); GGML_UNUSED(yb);
+#else
+        NO_DEVICE_CODE;
+#endif
     }
 }
 
@@ -667,7 +799,7 @@ static __global__ void mul_mat_q_pq2_j128(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int ncols_dst, const int ntx, const float * res, float * dst_add) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && !defined(GGML_USE_HIP)
     constexpr int I    = 128; // tile of the old kernel
     constexpr int J    = 128;
     constexpr int ROWS = 64;
@@ -703,6 +835,7 @@ static __global__ void mul_mat_q_pq2_j128(
     }
     uint32_t ph = 0; // stream-k: wait parity per Y buffer (bit b = buffer b)
     if constexpr (!PURE) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
         const uint32_t bar = smem + (uint32_t) (2*128*4*ggml_cuda_pq2_j128_ys) + 136u;
         if (threadIdx.x == 0 && threadIdx.y == 0) {
             ggml_cuda_pq2_j128_mbar_init(bar);
@@ -710,6 +843,9 @@ static __global__ void mul_mat_q_pq2_j128(
             ggml_cuda_pq2_j128_mbar_fence_init();
         }
         __syncthreads();
+#else
+        NO_DEVICE_CODE;
+#endif
     }
     if constexpr (PURE) {
         const int jt = b % ntx;
@@ -877,8 +1013,9 @@ static __global__ void mul_mat_q_pq2_j128_fixup_add(
 // Host side (included by mmq.cuh after mmq_args). Used on NVIDIA sm_90+ (see launch_mul_mat_q), for
 // mul_mat_q<GGML_TYPE_PQ2_0, 128, false> without ids/channels/samples.
 
-static constexpr size_t ggml_cuda_pq2_j128_smem() {
-    return (size_t) (2*128*ggml_cuda_pq2_j128_ys + 64*ggml_cuda_pq2_j128_xs)*sizeof(int);
+static constexpr size_t ggml_cuda_pq2_j128_smem(const int cc) {
+    const int ny = cc < GGML_CUDA_CC_AMPERE ? 1 : 2;
+    return (size_t) (ny*128*ggml_cuda_pq2_j128_ys + 64*ggml_cuda_pq2_j128_xs)*sizeof(int);
 }
 
 static bool ggml_cuda_mmq_pq2_j128_supported(const mmq_args & args) {
@@ -896,28 +1033,31 @@ static bool ggml_cuda_mmq_pq2_j128_supported(const mmq_args & args) {
         ((args.nrows_x + 127)/128)*((args.ncols_max + 127)/128)*(args.ncols_x/QK_PQ2_0) < (int64_t(1) << 30);
 }
 
-// GGML_CUDA_PQ2_J128: 0 = off, any other integer = on (any NVIDIA sm_90+ device). Unset: on for Hopper (cc 9.x), where
-// it is validated bit-exact and faster; opt-in on Blackwell/GB10.
+// GGML_CUDA_PQ2_J128: 0 = off, any other integer = on (NVIDIA sm_75+ / sm_90+ device). Unset: on for Turing and Hopper.
 static bool ggml_cuda_pq2_j128_enabled(const int cc) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_PQ2_J128");
         return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0);
     }();
-    return env >= 0 ? env == 1 : cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
+    return env >= 0 ? env == 1 : (cc == GGML_CUDA_CC_TURING || (cc >= GGML_CUDA_CC_HOPPER && cc < 1000));
 }
 
-// GGML_CUDA_PTQ1_J128: 1 = run PTQ1_0 J=128 prefill through the same kernel on NVIDIA sm_90+, 0 = off,
-// unset = follow GGML_CUDA_PREFILL_OPT.
+// GGML_CUDA_PTQ1_J128: 1 = run PTQ1_0 J=128 prefill through the same kernel on NVIDIA sm_75+ / sm_90+, 0 = off,
+// unset = follow GGML_CUDA_PREFILL_OPT (or on for Turing).
 static bool ggml_cuda_ptq1_j128_enabled(const int cc) {
     static const int env = ggml_cuda_env_tristate("GGML_CUDA_PTQ1_J128");
-    return env >= 0 ? env == 1 : ggml_cuda_prefill_opt(cc);
+    return env >= 0 ? env == 1 : (cc == GGML_CUDA_CC_TURING || ggml_cuda_prefill_opt(cc));
 }
 
 // Same grid rule as launch_mul_mat_q for the PQ2_0 J=128 (stream-k) config on NVIDIA.
-static int ggml_cuda_mmq_pq2_j128_grid(const mmq_args & args, const int nsm) {
+// On Turing/Ampere (< Hopper), always use PURE tiling (grid = ntiles) so TMA is not required.
+static int ggml_cuda_mmq_pq2_j128_grid(const mmq_args & args, const int nsm, const int cc) {
     const int nty    = (int) ((args.nrows_x + 127) / 128);
     const int ntx    = (int) ((args.ncols_max + 127) / 128);
     const int ntiles = nty*ntx;
+    if (cc < GGML_CUDA_CC_HOPPER) {
+        return ntiles;
+    }
     const int nwaves = (ntiles + nsm - 1) / nsm;
     const int eff    = 100*ntiles / (nsm*nwaves);
     return eff >= 90 ? ntiles : nsm;
@@ -941,19 +1081,30 @@ static int ggml_cuda_pq2_prefill_compact_mode() {
     return mode;
 }
 
+static bool ggml_cuda_pq2_d1_enabled() {
+    static const bool env = []() { const char * v = getenv("GGML_CUDA_PQ2_D1"); return v != nullptr && atoi(v) != 0; }();
+    return env;
+}
+
 template <ggml_type type, bool PURE, bool ADD, bool COMPACT = false>
 static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid, float * tmp_fixup, cudaStream_t stream) {
-    constexpr size_t smem = ggml_cuda_pq2_j128_smem() + (PURE ? 0 : 4096); // stream-k: + 2 x 2 KB transposed D4 scales
+    const int device = ggml_cuda_get_device();
+    const int cc     = ggml_cuda_info().devices[device].cc;
+    const size_t smem = ggml_cuda_pq2_j128_smem(cc) + (PURE ? 0 : 4096); // stream-k: + 2 x 2 KB transposed D4 scales
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
-    const auto kernel = (COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1)
-        ? mul_mat_q_pq2_j128<PURE, ADD, false, true, false, type> : mul_mat_q_pq2_j128<PURE, ADD, false, false, false, type>;
-    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
-    const int device = ggml_cuda_get_device();
-    if (!attr_set[device]) {
+    const bool use_d1 = PURE && cc < GGML_CUDA_CC_AMPERE && ggml_cuda_pq2_d1_enabled();
+    const auto kernel = use_d1
+        ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true, type>
+        : ((COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1)
+            ? mul_mat_q_pq2_j128<PURE, ADD, false, true, false, type>
+            : mul_mat_q_pq2_j128<PURE, ADD, false, false, false, type>);
+    static bool attr_set[GGML_CUDA_MAX_DEVICES][3] = {};
+    const int kidx = use_d1 ? 2 : ((COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1) ? 1 : 0);
+    if (!attr_set[device][kidx]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr_set[device] = true;
+        attr_set[device][kidx] = true;
     }
     kernel<<<dim3(2*grid, 1, 1), dim3(32, 8, 1), smem, stream>>>(args.x, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, ntx, (const float *) nullptr, (float *) nullptr);

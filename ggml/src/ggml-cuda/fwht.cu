@@ -338,7 +338,7 @@ template <int N, int NT, typename T, bool has_signs, bool glu = false>
 __launch_bounds__(NT, 1)
 __global__ void fwht_quantize_mmq_d4_block(const T * src, fwht_q8_1_mmq_d4 * y, const int64_t n_rows, const float scale,
                                            const float * signs, const int n_blk, const int64_t K, const int64_t ncols,
-                                           const float * glu_up = nullptr) {
+                                           const float * glu_up = nullptr, const bool d1_128 = false) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
@@ -399,6 +399,10 @@ __global__ void fwht_quantize_mmq_d4_block(const T * src, fwht_q8_1_mmq_d4 * y, 
         for (int offset = 32/8; offset > 0; offset >>= 1) {
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, warp_size));
         }
+        if (d1_128) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 8,  warp_size));
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 16, warp_size));
+        }
         const float d_inv = 127.0f / amax;
         char4 q;
         q.x = roundf(xi.x*d_inv);
@@ -430,14 +434,15 @@ bool ggml_cuda_fwht_quantize_mmq_d4(const void * x, ggml_type xt, const float * 
     const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream);
     fwht_q8_1_mmq_d4 * y = (fwht_q8_1_mmq_d4 *) out;
+    static const bool d1_128 = []() { const char * v = getenv("GGML_CUDA_PQ2_D1"); return v != nullptr && atoi(v) != 0; }();
 #define FQM_CASE(NN) \
     case NN: \
         if (xt == GGML_TYPE_F32) { \
-            if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true>,  lp, (const float *) x, y, rows, scale, signs, n_blk, K, ncols); \
-            else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, false>, lp, (const float *) x, y, rows, scale, nullptr, 1, K, ncols); \
+            if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true>,  lp, (const float *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr, d1_128); \
+            else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, false>, lp, (const float *) x, y, rows, scale, nullptr, 1, K, ncols, (const float *) nullptr, d1_128); \
         } else { \
-            if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, true>,   lp, (const half *) x, y, rows, scale, signs, n_blk, K, ncols); \
-            else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, false>,  lp, (const half *) x, y, rows, scale, nullptr, 1, K, ncols); \
+            if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, true>,   lp, (const half *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr, d1_128); \
+            else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, false>,  lp, (const half *) x, y, rows, scale, nullptr, 1, K, ncols, (const float *) nullptr, d1_128); \
         } \
         return true;
     if (!glu_up) {
@@ -445,11 +450,11 @@ bool ggml_cuda_fwht_quantize_mmq_d4(const void * x, ggml_type xt, const float * 
         switch (n) {
 #define FQN_CASE(NN) case NN: \
             if (xt == GGML_TYPE_F32) { \
-                if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true>,  lp, (const float *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr); \
-                else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, false>, lp, (const float *) x, y, rows, scale, (const float *) nullptr, 1, K, ncols, (const float *) nullptr); \
+                if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true>,  lp, (const float *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr, d1_128); \
+                else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, false>, lp, (const float *) x, y, rows, scale, (const float *) nullptr, 1, K, ncols, (const float *) nullptr, d1_128); \
             } else { \
-                if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, true>,   lp, (const half *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr); \
-                else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, false>,  lp, (const half *) x, y, rows, scale, (const float *) nullptr, 1, K, ncols, (const float *) nullptr); \
+                if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, true>,   lp, (const half *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr, d1_128); \
+                else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, false>,  lp, (const half *) x, y, rows, scale, (const float *) nullptr, 1, K, ncols, (const float *) nullptr, d1_128); \
             } \
             return true;
             FQN_CASE(512)
@@ -467,7 +472,7 @@ bool ggml_cuda_fwht_quantize_mmq_d4(const void * x, ggml_type xt, const float * 
         }
         switch (n) {
 #define FQG_CASE(NN) case NN: ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true, true>, lp, \
-                (const float *) x, y, rows, scale, signs, n_blk, K, ncols, glu_up); return true;
+                (const float *) x, y, rows, scale, signs, n_blk, K, ncols, glu_up, d1_128); return true;
             FQG_CASE(512)
             FQG_CASE(1024)
             FQG_CASE(2048)

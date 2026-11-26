@@ -13,7 +13,7 @@ static constexpr __host__ __device__ int gdn_cols_per_warp(int arch, int S_v, bo
     (void) arch; (void) S_v; (void) KDA;
     return 1;
 #else
-    return GGML_CUDA_CC_IS_NVIDIA(arch) && arch >= GGML_CUDA_CC_AMPERE && S_v == 128 && !KDA ? 4 : 1;
+    return GGML_CUDA_CC_IS_NVIDIA(arch) && arch >= GGML_CUDA_CC_TURING && S_v == 128 && !KDA ? 4 : 1;
 #endif
 }
 
@@ -332,7 +332,7 @@ static void launch_gated_delta_net(
             if constexpr (!KDA && !G_PRECOMPUTED) {
                 const int l8p = gdn_l8p_cfg(cc);
                 if (allow_l8p && l8p > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) &&
-                    ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
+                    ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && warp_size == 32 &&
                     cols_per_warp == 4 && n_tokens >= GDN_L8P_MIN_TOKENS) {
                     int c = l8p;
                     if (c == 1) {
@@ -373,7 +373,7 @@ static void launch_gated_delta_net(
             }
             if constexpr (keep_rs_t && !KDA) {
                 if (l8_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) &&
-                    ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
+                    ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && warp_size == 32 &&
                     cols_per_warp == 4 && n_tokens >= GDN_L8V_MIN_TOKENS && n_tokens <= GDN_L8V_MAX_TOKENS) {
                     ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED>, launch_params, q_d, k_d,
                                             v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H, n_tokens, n_seqs,
@@ -714,4 +714,349 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+}
+
+// ARC-LAB: CUDA GATED_DELTA_NET_REPLAY (rollback by replay, supports n_seqs >= 1 + Turing cols_per_warp = 4)
+struct gdn_replay_emit {
+    float *         base           = nullptr; // [D, n_seqs]
+    float *         rec            = nullptr; // [R*(K-1), ...]
+    const int64_t * rec_rows       = nullptr; // device I64[n_seqs] or nullptr
+    int64_t         rec_row_stride = 0;       // stride in floats between rec_rows entries
+    int64_t         t_base         = 0;       // token whose post-state is base (< 0: replay-only)
+    int64_t         R              = 0;       // H * (2 * S_v + 1)
+};
+
+template <int S_v>
+__global__ void gdn_replay_seq_cuda(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        const float * __restrict__ curr_state,
+        float * __restrict__ dst,
+        int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        uint3 neqk1_magic, uint3 rq3_magic,
+        float scale,
+        const int32_t * __restrict__ s_ids, int64_t s_row_stride,
+        const float * __restrict__ rec_in, int64_t rec_in_seq_stride, int64_t rec_in_bank_stride,
+        const int32_t * __restrict__ ctrl,
+        gdn_replay_emit em) {
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    constexpr int  warp_size     = WARP_SIZE < S_v ? WARP_SIZE : S_v;
+    constexpr int  rows_per_lane = (S_v + warp_size - 1) / warp_size;
+#if defined(__CUDA_ARCH__)
+    constexpr int  cols_per_warp = gdn_cols_per_warp(__CUDA_ARCH__, S_v, false);
+#else
+    constexpr int  cols_per_warp = 1;
+#endif
+    const int      col           = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t state_in_offset = (s_ids ? (int64_t) s_ids[sequence] * s_row_stride : (int64_t) sequence * H * S_v * S_v) +
+                                    (int64_t) h_idx * S_v * S_v;
+    curr_state += state_in_offset + col * S_v;
+    float * attn_data = dst + ((int64_t) sequence * n_tokens * H + h_idx) * S_v;
+
+    float s_shard[cols_per_warp][rows_per_lane];
+#pragma unroll
+    for (int c = 0; c < cols_per_warp; ++c) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            s_shard[c][r] = curr_state[c * S_v + r * warp_size + lane];
+        }
+    }
+
+    // Replay prologue: re-apply n_rec stored records onto the base state
+    if (rec_in != nullptr) {
+        const int32_t n_rec     = ctrl[2 * sequence + 0];
+        const int32_t bank_cell = ctrl[2 * sequence + 1];
+        const int32_t rec_cell  = (n_seqs == 1) ? 0 : (bank_cell >> 1);
+        const int32_t bank      = bank_cell & 1;
+        const float * rb        = rec_in + (int64_t) rec_cell * rec_in_seq_stride + (int64_t) bank * rec_in_bank_stride;
+        for (int32_t j = 0; j < n_rec; ++j) {
+            const float * rj    = rb + (int64_t) j * em.R;
+            const float   g_val = rj[2 * H * S_v + h_idx];
+            const float * k_t   = rj + H * S_v + h_idx * S_v;
+            float k_reg[rows_per_lane];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                k_reg[r] = k_t[r * warp_size + lane];
+            }
+#pragma unroll
+            for (int c = 0; c < cols_per_warp; ++c) {
+                const float delta_col = rj[h_idx * S_v + col + c];
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; ++r) {
+                    s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                }
+            }
+        }
+    }
+
+    float * base_out = em.base ? em.base + ((int64_t) sequence * H + h_idx) * S_v * S_v + col * S_v : nullptr;
+    float * rec_seq  = em.rec ? em.rec + (em.rec_rows ? em.rec_rows[sequence] : (int64_t) sequence) * em.rec_row_stride
+                              : nullptr;
+
+    if (em.t_base < 0 && base_out) {
+#pragma unroll
+        for (int c = 0; c < cols_per_warp; ++c) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                base_out[c * S_v + r * warp_size + lane] = s_shard[c][r];
+            }
+        }
+    }
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+        const float   beta_val  = beta[gb_offset];
+        const float   g_val     = expf(g[gb_offset]);
+
+        float q_reg[rows_per_lane];
+        float k_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int i = r * warp_size + lane;
+            q_reg[r] = q_t[i];
+            k_reg[r] = k_t[i];
+        }
+
+        float delta_vals[cols_per_warp];
+#pragma unroll
+        for (int c = 0; c < cols_per_warp; ++c) {
+            float kv_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                kv_shard += s_shard[c][r] * k_reg[r];
+            }
+            const float kv_col    = warp_reduce_sum<warp_size>(kv_shard);
+            const float delta_col = (v_t[col + c] - g_val * kv_col) * beta_val;
+            delta_vals[c] = delta_col;
+
+            float attn_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                s_shard[c][r]  = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                attn_partial  += s_shard[c][r] * q_reg[r];
+            }
+            const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            if (lane == 0) {
+                attn_data[col + c] = attn_col * scale;
+            }
+        }
+        attn_data += S_v * H;
+
+        // Epilogue: store base state at t_base, or update record for t > t_base
+        if (t == em.t_base) {
+            if (base_out) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; ++r) {
+                        base_out[c * S_v + r * warp_size + lane] = s_shard[c][r];
+                    }
+                }
+            }
+        } else if (t > em.t_base && rec_seq) {
+            float * rt = rec_seq + (int64_t) (t - em.t_base - 1) * em.R;
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    rt[h_idx * S_v + col + c] = delta_vals[c];
+                }
+            }
+            if (col == 0) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; ++r) {
+                    const int i = r * warp_size + lane;
+                    rt[H * S_v + h_idx * S_v + i] = k_reg[r];
+                }
+                if (lane == 0) {
+                    rt[2 * H * S_v + h_idx] = g_val;
+                }
+            }
+        }
+    }
+}
+
+static void launch_gdn_replay_seq(
+        const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
+        const float * s_d, float * dst_d, int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3, int64_t neqk1, int64_t rq3, float scale,
+        const int32_t * s_ids, int64_t s_row_stride,
+        const float * rec_in, int64_t rec_in_seq_stride, int64_t rec_in_bank_stride,
+        const int32_t * ctrl, const gdn_replay_emit & em, cudaStream_t stream) {
+    GGML_ASSERT(S_v == 128);
+    const int cc            = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int cols_per_warp = gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc), 128, false);
+    const int num_warps     = 4;
+    const int cols_per_blk  = num_warps * cols_per_warp;
+    dim3 grid_dims(H, n_seqs, (S_v + cols_per_blk - 1) / cols_per_blk);
+    dim3 block_dims(WARP_SIZE, num_warps, 1);
+
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+
+    gdn_replay_seq_cuda<128><<<grid_dims, block_dims, 0, stream>>>(
+        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens, n_seqs,
+        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale,
+        s_ids, s_row_stride, rec_in, rec_in_seq_stride, rec_in_bank_stride, ctrl, em);
+}
+
+__global__ static void gdn_set_rows_batched_cuda(
+        const float * __restrict__ src,
+        float * __restrict__ dst_base,
+        const int64_t * __restrict__ wrows,
+        const int64_t n_elems,
+        const int64_t cell_stride,
+        const int64_t bank_stride) {
+    const int64_t si   = blockIdx.y;
+    const int64_t bank = wrows[si];
+    const float * s    = src + si * bank_stride;
+    float *       d    = dst_base + si * cell_stride + bank * bank_stride;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    const int64_t tid    = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if ((((uintptr_t) s | (uintptr_t) d) & 15) == 0) {
+        const int64_t n4 = n_elems >> 2;
+        const float4 * s4 = (const float4 *) s;
+        float4 *       d4 = (float4 *) d;
+        for (int64_t i = tid; i < n4; i += stride) {
+            d4[i] = s4[i];
+        }
+        for (int64_t i = (n4 << 2) + tid; i < n_elems; i += stride) {
+            d[i] = s[i];
+        }
+    } else {
+        for (int64_t i = tid; i < n_elems; i += stride) {
+            d[i] = s[i];
+        }
+    }
+}
+
+void ggml_cuda_op_gated_delta_net_replay(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gdn_replay_fused * fused) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_rec   = dst->src[6];
+    const ggml_tensor * src_ctrl  = dst->src[7];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
+
+    const int64_t S_v      = nev0;
+    const int64_t H        = nev1;
+    const int64_t n_tokens = nev2;
+    const int64_t n_seqs   = nev3;
+    const int64_t neqk1    = neq1;
+    const int64_t rq3      = nev3 / neq3;
+    const int     K        = ggml_get_op_params_i32(dst, 0);
+    const int64_t D        = S_v * S_v * H;
+    const int64_t R        = H * (2 * S_v + 1);
+
+    const float * q_d    = (const float *) src_q->data;
+    const float * k_d    = (const float *) src_k->data;
+    const float * v_d    = (const float *) src_v->data;
+    const float * g_d    = (const float *) src_g->data;
+    const float * b_d    = (const float *) src_beta->data;
+    const float * s_d    = (const float *) src_state->data;
+    const float * rec_d  = (const float *) src_rec->data;
+    const int32_t * ctrl = (const int32_t *) src_ctrl->data;
+    float *       dst_d  = (float *) dst->data;
+
+    const int32_t * s_ids        = nullptr;
+    int64_t         s_row_stride = 0;
+    if (const ggml_cuda_gated_delta_net_gather * gather = ctx.gdn_gathers().find(dst)) {
+        s_d          = gather->base;
+        s_ids        = gather->ids;
+        s_row_stride = gather->row_stride;
+    }
+
+    const int64_t sq1 = nbq1 / sizeof(float);
+    const int64_t sq2 = nbq2 / sizeof(float);
+    const int64_t sq3 = nbq3 / sizeof(float);
+    const int64_t sv1 = nbv1 / sizeof(float);
+    const int64_t sv2 = nbv2 / sizeof(float);
+    const int64_t sv3 = nbv3 / sizeof(float);
+    const int64_t sb1 = nbb1 / sizeof(float);
+    const int64_t sb2 = nbb2 / sizeof(float);
+    const int64_t sb3 = nbb3 / sizeof(float);
+
+    const int64_t rec_in_bank_stride = (int64_t) (src_rec->nb[1] / sizeof(float));
+    const int64_t rec_in_seq_stride  = (int64_t) (src_rec->nb[2] / sizeof(float));
+    const float   scale              = 1.0f / sqrtf((float) S_v);
+    cudaStream_t  stream             = ctx.stream();
+
+    const int64_t m = std::min<int64_t>(n_tokens - 1, K - 1);
+    gdn_replay_emit em;
+    em.t_base         = n_tokens - 1 - m;
+    em.R              = R;
+    em.base           = (fused && fused->base) ? fused->base : (dst_d + S_v * H * n_tokens * n_seqs);
+    em.rec            = (fused && fused->rec)  ? fused->rec  : (dst_d + S_v * H * n_tokens * n_seqs + D * n_seqs);
+    em.rec_rows       = (fused && fused->rec)  ? fused->rec_rows : nullptr;
+    em.rec_row_stride = (fused && fused->rec)  ? fused->rec_row_stride : R * (K - 1);
+
+    // Chunked MMA prefill fast path for single-sequence long prompts (keeps full Turing FAST_F16 speed)
+    static const bool mma_off = getenv("GGML_CUDA_GDN_MMA") == nullptr || atoi(getenv("GGML_CUDA_GDN_MMA")) == 0;
+    const int64_t n_mma = (n_seqs == 1 && n_tokens > K) ? (n_tokens - K) : 0;
+    if (!mma_off && n_mma >= 64 && S_v == 128 && neq0 == 128 && ggml_cuda_gdn_mma_device_supported(ctx.device)) {
+        ggml_cuda_pool_alloc<float> s_rpl(ctx.pool(), (size_t) D * n_seqs);
+        ggml_cuda_pool_alloc<float> s_mid(ctx.pool(), (size_t) D * n_seqs);
+        gdn_replay_emit em0;
+        em0.base   = s_rpl.ptr;
+        em0.t_base = -1;
+        em0.R      = R;
+        launch_gdn_replay_seq(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, 0, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+            s_ids, s_row_stride, rec_d, rec_in_seq_stride, rec_in_bank_stride, ctrl, em0, stream);
+
+        ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+        args.eligible  = true;
+        args.n_tokens  = n_mma;
+        args.state     = s_rpl.ptr;
+        args.state_out = s_mid.ptr;
+        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+            const int64_t t0 = n_mma;
+            gdn_replay_emit em1 = em;
+            em1.t_base = 0; // base state after token t0 (first of last K), records for remaining K-1 tokens
+            launch_gdn_replay_seq(
+                q_d + t0 * sq2, k_d + t0 * sq2, v_d + t0 * sv2, g_d + t0 * sb2, b_d + t0 * sb2,
+                s_mid.ptr, dst_d + t0 * S_v * H, S_v, H, K, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                nullptr, 0, nullptr, 0, 0, nullptr, em1, stream);
+            return;
+        }
+    }
+
+    launch_gdn_replay_seq(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs,
+        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+        s_ids, s_row_stride, rec_d, rec_in_seq_stride, rec_in_bank_stride, ctrl, em, stream);
+
+    if (fused && fused->rec_batch_dst && fused->rec_batch_wrows && n_seqs > 1 && K > 1) {
+        const int64_t n_elems = R * (K - 1);
+        const int blocks_x = (int) std::min<int64_t>(32, ((n_elems >> 2) + 255) / 256);
+        dim3 grid(std::max(1, blocks_x), (unsigned) n_seqs, 1);
+        gdn_set_rows_batched_cuda<<<grid, 256, 0, stream>>>(
+            em.rec, fused->rec_batch_dst, fused->rec_batch_wrows,
+            n_elems, fused->rec_batch_cell_stride, fused->rec_batch_bank_stride);
+    }
 }

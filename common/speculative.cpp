@@ -2672,70 +2672,144 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 why = "not supported by this context (qwen35 single head, flash attention, plain KV cache)";
             } else if (is_mem_shared || chain_heads) {
                 why = "shared-memory or multi-head MTP";
-            } else if (n_seq != 1) {
-                why = "more than one sequence";
             } else if (this->params.p_min > 0.0f) {
                 why = "p_min > 0";
             }
             chain_mode = why == nullptr;
             if (chain_mode) {
-                SPC_INF("MTP chained drafts on (%s)\n", (sup & 2) ? "draft head" : "full head, host token lookups");
+                SPC_INF("MTP chained drafts on (%s, n_seq=%zu)\n", (sup & 2) ? "draft head" : "full head, host token lookups", n_seq);
             } else {
                 SPC_INF("MTP chained drafts off: %s\n", why);
             }
         }
     }
 
-    // ARC-LAB: one chained decode for the whole draft of sequence 0. Returns false when it does not apply (the loop
-    // runs), true when it ran (dparams[0].result holds the drafts, empty on failure).
+    // ARC-LAB: one chained decode for the whole draft of all active sequences. Returns false when it does not apply
+    // (the loop runs), true when it ran (each active dparams[seq].result holds the drafts, empty on failure).
     bool draft_chain(common_speculative_draft_params_vec & dparams) {
         auto * ctx_dft = params.ctx_dft;
-        auto & dp      = dparams[0];
-        auto & d       = deferred[0];
-        if (!dp.drafting || d.catchup_failed) {
+        std::vector<llama_seq_id> active;
+        active.reserve(n_seq);
+        int32_t n_catch_tot = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            auto & d  = deferred[seq_id];
+            if (!dp.drafting || d.catchup_failed) {
+                continue;
+            }
+            if (params.probabilistic && dp.result_q != nullptr) {
+                return false;
+            }
+            active.push_back(seq_id);
+            if (d.pending) {
+                n_catch_tot += d.n_valid;
+            }
+        }
+        const int32_t K = (int32_t) active.size();
+        if (K == 0) {
             return false;
         }
 
         // the loop's step count: it stops once min(n_max, LAB_SPEC_DRAFT_N_MAX) tokens are drafted (at least one)
         const int32_t n_draft = std::max(1, std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)));
-        const int32_t n_catch = d.pending ? d.n_valid : 0;
-        const int32_t n_rows  = n_catch + n_draft;
-        if (n_draft < 2 || n_rows > (int32_t) std::min(llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft))) {
+        // For multi-seq (K >= 2), flush catch-up rows in a separate 1-layer decode pass first so
+        // the chained draft graph always has a fixed shape (n_draft * K) -> 100% CUDA-graph reuse
+        // and 1 mtp_chain_cache entry (no VRAM bloat or 72 ms/round graph rebuilds!).
+        const bool split_catch = (K >= 2 && n_catch_tot > 0);
+        const int32_t max_dft_ub = (int32_t) std::min(llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft));
+        const int32_t n_rows  = split_catch ? std::max(n_catch_tot, n_draft * K) : (n_catch_tot + n_draft * K);
+        if (n_draft < 2 || n_rows > max_dft_ub) {
             return false;
         }
 
         g_mtp_dt.lap(g_mtp_dt.pre);
-        common_sampler_reset(smpls[0].get());
         batch.clear();
 
-        // catch-up rows and the anchor exactly as the loop's first decode, then one placeholder row per later step
-        // (its cell receives that step's K/V; token and embd are not read)
-        for (int32_t k = 0; k < n_catch; ++k) {
-            const int idx = batch.add(d.tokens[k], d.pos[k], 0, false);
-            batch.set_embd_state(idx, { d.h.data() + (size_t) k * n_embd, 1, (size_t) n_embd });
+        std::vector<char> had_catch(K, 0);
+        if (split_catch) {
+            int32_t n_catch_added = 0;
+            for (int32_t i = 0; i < K; ++i) {
+                const llama_seq_id seq_id = active[i];
+                auto & d = deferred[seq_id];
+                if (d.pending && d.n_valid > 0) {
+                    for (int32_t k = 0; k < d.n_valid; ++k) {
+                        const int idx = batch.add(d.tokens[k], d.pos[k], seq_id, false);
+                        batch.set_embd_state(idx, { d.h.data() + (size_t) k * n_embd, 1, (size_t) n_embd });
+                        ++n_catch_added;
+                    }
+                    had_catch[i] = 1;
+                }
+            }
+            if (n_catch_added > 0) {
+                llama_set_mtp_chain_seqs(ctx_dft, 0, 1);
+                const int32_t rc_catch = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (rc_catch != 0) {
+                    SPC_ERR("llama_decode(ctx_dft) split catch-up returned %d\n", (int) rc_catch);
+                    for (int32_t i = 0; i < K; ++i) {
+                        if (had_catch[i]) {
+                            deferred[active[i]].catchup_failed = true;
+                        }
+                    }
+                    return true;
+                }
+                for (int32_t i = 0; i < K; ++i) {
+                    if (had_catch[i]) {
+                        deferred[active[i]].pending = false;
+                        had_catch[i] = 0;
+                    }
+                }
+            }
+            batch.clear();
         }
-        const int anchor = batch.add(dp.id_last, dp.pos0, 0, true);
-        batch.set_embd_state(anchor, { pending_h[0].data(), 1, (size_t) n_embd });
+
+        // step 0: for each active sequence, (optional single-seq catch-up rows) + anchor (output=true)
+        for (int32_t i = 0; i < K; ++i) {
+            const llama_seq_id seq_id = active[i];
+            auto & dp = dparams[seq_id];
+            auto & d  = deferred[seq_id];
+            if (!params.probabilistic) {
+                dp.result_q = nullptr;
+            }
+            common_sampler_reset(smpls[seq_id].get());
+            if (!split_catch && d.pending) {
+                for (int32_t k = 0; k < d.n_valid; ++k) {
+                    const int idx = batch.add(d.tokens[k], d.pos[k], seq_id, false);
+                    batch.set_embd_state(idx, { d.h.data() + (size_t) k * n_embd, 1, (size_t) n_embd });
+                }
+                had_catch[i] = 1;
+            }
+            const int anchor = batch.add(dp.id_last, dp.pos0, seq_id, true);
+            batch.set_embd_state(anchor, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+        }
+        // steps 1..n_draft-1: K placeholder rows per step (in active-sequence order)
         for (int32_t j = 1; j < n_draft; ++j) {
-            const int idx = batch.add(dp.id_last, dp.pos0 + j, 0, false);
-            batch.set_embd_state(idx, { pending_h[0].data(), 1, (size_t) n_embd });
+            for (int32_t i = 0; i < K; ++i) {
+                const llama_seq_id seq_id = active[i];
+                auto & dp = dparams[seq_id];
+                const int idx = batch.add(dp.id_last, dp.pos0 + j, seq_id, false);
+                batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            }
         }
 
         g_mtp_dt.lap(g_mtp_dt.batch);
-        llama_set_mtp_chain(ctx_dft, n_draft);
+        llama_set_mtp_chain_seqs(ctx_dft, n_draft, K);
         const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        llama_set_mtp_chain(ctx_dft, 0);
+        llama_set_mtp_chain_seqs(ctx_dft, 0, 1);
         g_mtp_dt.lap(g_mtp_dt.decode);
         g_mtp_dt.decodes++;
         if (rc != 0) {
             SPC_ERR("llama_decode(ctx_dft) chained draft returned %d\n", (int) rc);
-            if (n_catch > 0) {
-                d.catchup_failed = true;
+            for (int32_t i = 0; i < K; ++i) {
+                if (had_catch[i]) {
+                    deferred[active[i]].catchup_failed = true;
+                }
             }
             return true;
         }
-        if (n_catch > 0) {
-            d.pending = false;
+        for (int32_t i = 0; i < K; ++i) {
+            if (had_catch[i]) {
+                deferred[active[i]].pending = false;
+            }
         }
 
         const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft);
@@ -2745,22 +2819,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        auto *        smpl    = smpls[0].get();
-        auto &        result  = *dp.result;
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-        for (int32_t j = 0; j < n_draft; ++j) {
-            const llama_token id = ids[j];
-            if (FILE * lf = common_mtp_draft_log()) {
-                // the chain reads back token ids only: no candidate list or probabilities (p logged as -1)
-                fprintf(lf, "{\"pos\": %d, \"d\": %d, \"c\": [[%d, -1.0]], \"stop\": 0, \"chain\": 1}\n",
-                        (int) (dp.pos0 + j + 1), j, (int) id);
+        for (int32_t i = 0; i < K; ++i) {
+            const llama_seq_id seq_id = active[i];
+            auto * smpl   = smpls[seq_id].get();
+            auto & dp     = dparams[seq_id];
+            auto & result = *dp.result;
+            for (int32_t j = 0; j < n_draft; ++j) {
+                const llama_token id = ids[(size_t) j * K + i];
+                if (FILE * lf = common_mtp_draft_log()) {
+                    fprintf(lf, "{\"seq\": %d, \"pos\": %d, \"d\": %d, \"c\": [[%d, -1.0]], \"stop\": 0, \"chain\": 1}\n",
+                            (int) seq_id, (int) (dp.pos0 + j + 1), j, (int) id);
+                }
+                if (id < 0 || id >= n_vocab) {
+                    SPC_ERR("chained draft id %d out of vocab (seq %d step %d) - dropping the rest\n", (int) id, (int) seq_id, j);
+                    break;
+                }
+                common_sampler_accept(smpl, id, true);
+                result.push_back(id);
             }
-            if (id < 0 || id >= n_vocab) {
-                SPC_ERR("chained draft id %d out of vocab (step %d) - dropping the rest\n", (int) id, j);
-                break;
-            }
-            common_sampler_accept(smpl, id, true);
-            result.push_back(id);
         }
         return true;
     }
@@ -2960,11 +3037,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 all_ids = all_ids && batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
             }
 
-            // verify-sized batch of one sequence: hold the rows for draft() instead of decoding now.
+            // verify-sized batch (1 or more sequences): hold the rows for draft() instead of decoding now.
             // A stash that is still pending here belongs to an earlier batch: decode it first if this
             // batch continues it (prompt fed in small ubatches), drop it if the positions overlap
             // (the server rolled the sequence back and is replaying).
-            const bool defer = can_defer() && all_ids && n_seq_in_batch == 1 && n_tokens <= this->params.n_max + 1;
+            bool all_verify_sized = (n_seq_in_batch >= 1);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && all_verify_sized; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                const int32_t seq_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                if (seq_rows > this->params.n_max + 1) {
+                    all_verify_sized = false;
+                    break;
+                }
+                for (int k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                    if (batch_in.tokens[k].seq_id != seq_id) {
+                        all_verify_sized = false;
+                        break;
+                    }
+                }
+            }
+            const bool defer = can_defer() && all_ids && all_verify_sized;
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 auto & d = deferred[seq_id];
@@ -2982,21 +3076,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (defer) {
-                const llama_seq_id seq_id = batch_in.tokens[0].seq_id;
-                auto & d = deferred[seq_id];
-                d.tokens.resize(n_tokens);
-                d.pos.resize(n_tokens);
-                d.h.resize((size_t) n_tokens * n_embd);
-                for (int k = 0; k < n_tokens; ++k) {
-                    const float * h_row = k == i_batch_beg[seq_id]
-                        ? pending_h[seq_id].data()
-                        : h_tgt_rows + (size_t) (k - 1) * n_embd;
-                    d.tokens[k] = batch_in.tokens[k].id;
-                    d.pos[k]    = batch_in.tokens[k].pos[0];
-                    std::memcpy(d.h.data() + (size_t) k * n_embd, h_row, row_bytes);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    const int32_t beg = i_batch_beg[seq_id];
+                    const int32_t seq_rows = i_batch_end[seq_id] - beg + 1;
+                    auto & d = deferred[seq_id];
+                    d.tokens.resize(seq_rows);
+                    d.pos.resize(seq_rows);
+                    d.h.resize((size_t) seq_rows * n_embd);
+                    for (int k = 0; k < seq_rows; ++k) {
+                        const int bk = beg + k;
+                        const float * h_row = k == 0
+                            ? pending_h[seq_id].data()
+                            : h_tgt_rows + (size_t) (bk - 1) * n_embd;
+                        d.tokens[k] = batch_in.tokens[bk].id;
+                        d.pos[k]    = batch_in.tokens[bk].pos[0];
+                        std::memcpy(d.h.data() + (size_t) k * n_embd, h_row, row_bytes);
+                    }
+                    d.n_valid = seq_rows;
+                    d.pending = true;
                 }
-                d.n_valid = n_tokens;
-                d.pending = true;
             } else {
             batch.clear();
 
@@ -3148,9 +3249,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_mode && draft_chain(dparams)) {
             last_draft_chained = true;
-            auto & dp = dparams[0];
-            if (dp.result->size() < (size_t) params.n_min) {
-                dp.result->clear();
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (dp.drafting && dp.result && dp.result->size() < (size_t) params.n_min) {
+                    dp.result->clear();
+                }
             }
             return;
         }
@@ -4285,6 +4388,10 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.model.path;
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
+
+        if (getenv("LLAMA_MTP_CHAIN") && atoi(getenv("LLAMA_MTP_CHAIN")) != 0 && cparams.n_seq_max > 1) {
+            cparams.kv_unified = true;
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
         if (ctx_dft == nullptr) {

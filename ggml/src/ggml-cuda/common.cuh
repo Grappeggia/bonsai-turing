@@ -1360,7 +1360,7 @@ static inline int ggml_cuda_pq2_mc_min(int cc) {
     if (env > 0) {
         return env;
     }
-    return cc == GGML_CUDA_CC_HOPPER ? 1 : 3;
+    return (cc == GGML_CUDA_CC_HOPPER || cc == GGML_CUDA_CC_TURING) ? 1 : 3;
 }
 
 static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
@@ -1370,7 +1370,7 @@ static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #else
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     return !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) &&
-        (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER) && ncols_dst >= ggml_cuda_pq2_mc_min(cc) && ncols_dst <= 8;
+        (cc == GGML_CUDA_CC_TURING || cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER) && ncols_dst >= ggml_cuda_pq2_mc_min(cc) && ncols_dst <= 8;
 #endif
 }
 

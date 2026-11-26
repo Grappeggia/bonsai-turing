@@ -144,8 +144,14 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 // every warp gather with a large stride for this layout.
 static __global__ void concat_dim0_transpose_u32(
         const uint32_t * src0, const char * src1, uint32_t * dst,
-        int ne00, int rows, int cols, uint64_t src1_col_stride, int dst_row_stride) {
+        int ne00, int rows, int cols, uint64_t src1_col_stride, int dst_row_stride,
+        int64_t src0_plane_elems, uint64_t src1_plane_bytes, int64_t dst_plane_elems) {
     __shared__ uint32_t tile[32][33];
+
+    const int64_t i2 = blockIdx.z;
+    src0 += i2 * src0_plane_elems;
+    src1 += (uint64_t) i2 * src1_plane_bytes;
+    dst  += i2 * dst_plane_elems;
 
     const int input_x = (int) blockIdx.x*32 + threadIdx.x; // output row / input column
     const int input_y0 = (int) blockIdx.y*32 + threadIdx.y; // output column / input row
@@ -200,18 +206,19 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         if constexpr (sizeof(T) == sizeof(uint32_t)) {
-            const bool transpose_dim0 = dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[0] <= 8 &&
+            const bool transpose_dim0 = dim == 0 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+                src0->ne[2] == src1->ne[2] && src0->ne[2] == dst->ne[2] && src0->ne[0] <= 8 &&
                 src0->nb[0] == sizeof(uint32_t) && src0->nb[1] == (uint64_t) src0->ne[0]*sizeof(uint32_t) &&
                 src1->nb[1] == sizeof(uint32_t) && dst->nb[0] == sizeof(uint32_t) &&
                 dst->nb[1] == (uint64_t) dst->ne[0]*sizeof(uint32_t) &&
                 src0->ne[1] == src1->ne[1] && src0->ne[1] == dst->ne[1] &&
                 src0->ne[0] + src1->ne[0] == dst->ne[0];
             if (transpose_dim0) {
-                const dim3 grid((dst->ne[1] + 31)/32, (src1->ne[0] + 31)/32, 1);
+                const dim3 grid((dst->ne[1] + 31)/32, (src1->ne[0] + 31)/32, dst->ne[2]);
                 concat_dim0_transpose_u32<<<grid, dim3(32, 8, 1), 0, stream>>>(
                     (const uint32_t *) src0->data, (const char *) src1->data, (uint32_t *) dst->data,
-                    src0->ne[0], dst->ne[1], src1->ne[0], src1->nb[0], dst->nb[1]/sizeof(uint32_t));
+                    src0->ne[0], dst->ne[1], src1->ne[0], src1->nb[0], dst->nb[1]/sizeof(uint32_t),
+                    (int64_t) (src0->nb[2]/sizeof(uint32_t)), src1->nb[2], (int64_t) (dst->nb[2]/sizeof(uint32_t)));
                 return;
             }
         }

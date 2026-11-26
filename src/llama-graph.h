@@ -364,6 +364,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    bool rpl_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -951,8 +952,8 @@ struct llm_graph_params {
             return false;
         }
 
-        // ARC-LAB: a chained MTP draft graph only for the same step count (its input checks the per-step KV lengths)
-        if (cparams.mtp_chain_n != other.cparams.mtp_chain_n) {
+        // ARC-LAB: a chained MTP draft graph only for the same step and sequence count (its input checks the per-step KV lengths)
+        if (cparams.mtp_chain_n != other.cparams.mtp_chain_n || cparams.mtp_chain_n_seq != other.cparams.mtp_chain_n_seq) {
             return false;
         }
 

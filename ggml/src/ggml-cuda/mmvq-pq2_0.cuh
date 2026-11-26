@@ -11,20 +11,106 @@
 #include "common.cuh"
 #include "unary.cuh"
 
+#include <mutex>
+#include <unordered_map>
+
 #define PQ2_0_MC_ROWS  4
 #define PQ2_0_MC_WARPS 4
+
+// Optional SoA-aligned PQ2_0 weight cache (uint2 qs[nrows * stride_row_x * 4] + half d[nrows * stride_row_x]):
+// Eliminates 34-byte unaligned 5x LDG.16 per chunk -> single coalesced LDG.64 + cached half scale!
+struct pq2_0_soa_entry {
+    uint2 * qs;
+    half  * d;
+    int     nrows;
+    int     stride_row_x;
+};
+
+__global__ static void pq2_0_repack_to_soa_kernel(
+        const block_pq2_0 * __restrict__ src, uint2 * __restrict__ dst_qs, half * __restrict__ dst_d,
+        const int nrows, const int stride_row_x) {
+    const int row = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const block_pq2_0 * row_src = src + (int64_t) row * stride_row_x;
+    uint2 * row_qs = dst_qs + (int64_t) row * stride_row_x * 4;
+    half  * row_d  = dst_d  + (int64_t) row * stride_row_x;
+    for (int b = threadIdx.x; b < stride_row_x; b += blockDim.x) {
+        const block_pq2_0 * blk = row_src + b;
+        row_d[b] = blk->d;
+#pragma unroll
+        for (int kq = 0; kq < 4; ++kq) {
+            const uint16_t * qp = (const uint16_t *) (blk->qs + kq * 8);
+            uint2 w;
+            w.x = (uint32_t) qp[0] | ((uint32_t) qp[1] << 16);
+            w.y = (uint32_t) qp[2] | ((uint32_t) qp[3] << 16);
+            row_qs[b * 4 + kq] = w;
+        }
+    }
+}
+
+static bool pq2_0_align_cache_enabled() {
+    static const bool en = []() {
+        const char * v = getenv("GGML_CUDA_PQ2_ALIGN_CACHE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
+static pq2_0_soa_entry get_or_repack_pq2_soa(
+        const void * vx, const int nrows, const int stride_row_x, cudaStream_t stream) {
+    static std::mutex mu;
+    static std::unordered_map<const void *, pq2_0_soa_entry> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(vx);
+    if (it != cache.end() && it->second.nrows == nrows && it->second.stride_row_x == stride_row_x) {
+        return it->second;
+    }
+    pq2_0_soa_entry e{};
+    e.nrows = nrows;
+    e.stride_row_x = stride_row_x;
+    const size_t qs_bytes = (size_t) nrows * (size_t) stride_row_x * 4 * sizeof(uint2);
+    const size_t d_bytes  = (size_t) nrows * (size_t) stride_row_x * sizeof(half);
+    if (cudaMalloc(&e.qs, qs_bytes) == cudaSuccess) {
+        if (cudaMalloc(&e.d, d_bytes) == cudaSuccess) {
+            pq2_0_repack_to_soa_kernel<<<(unsigned) nrows, 128, 0, stream>>>(
+                (const block_pq2_0 *) vx, e.qs, e.d, nrows, stride_row_x);
+            cache[vx] = e;
+            return e;
+        } else {
+            (void) cudaGetLastError();
+            cudaFree(e.qs);
+            e.qs = nullptr;
+        }
+    } else {
+        (void) cudaGetLastError();
+    }
+    e.qs = nullptr;
+    e.d  = nullptr;
+    return e;
+}
 
 // All weight reads of the kernel below go through this one helper. For 32-element chunk c of a row it returns the
 // 8 code bytes (as two words: elements 0-15 and 16-31) and the block scale. It is the only place that knows the
 // 34-byte block layout [d: half][qs: 32 bytes]; a repack of the weights only has to replace it.
+template <bool aligned_soa = false>
 static __device__ __forceinline__ void pq2_0_mc_load_chunk(
-        const void * GGML_CUDA_RESTRICT vx, const int64_t row, const int stride_row_x, const int c,
+        const void * GGML_CUDA_RESTRICT vx, const half * GGML_CUDA_RESTRICT vxd,
+        const int64_t row, const int stride_row_x, const int c,
         uint32_t & w0, uint32_t & w1, float & d) {
-    const block_pq2_0 * blk = (const block_pq2_0 *) vx + row*stride_row_x + (c >> 2);
-    const uint16_t    * qp  = (const uint16_t *) (blk->qs + (c & 3)*8); // blocks are only 2-byte aligned
-    d  = __half2float(blk->d);
-    w0 = (uint32_t) qp[0] | ((uint32_t) qp[1] << 16);
-    w1 = (uint32_t) qp[2] | ((uint32_t) qp[3] << 16);
+    if constexpr (aligned_soa) {
+        const uint2 w = ((const uint2 *) vx)[row * (stride_row_x * 4) + c];
+        w0 = w.x;
+        w1 = w.y;
+        d  = __half2float(__ldg(vxd + row * stride_row_x + (c >> 2)));
+    } else {
+        const block_pq2_0 * blk = (const block_pq2_0 *) vx + row*stride_row_x + (c >> 2);
+        const uint16_t    * qp  = (const uint16_t *) (blk->qs + (c & 3)*8); // blocks are only 2-byte aligned
+        d  = __half2float(blk->d);
+        w0 = (uint32_t) qp[0] | ((uint32_t) qp[1] << 16);
+        w1 = (uint32_t) qp[2] | ((uint32_t) qp[3] << 16);
+    }
 }
 
 // Launch geometry (all template parameters, so they can be retuned independently of the kernel body):
@@ -39,11 +125,11 @@ static __device__ __forceinline__ void pq2_0_mc_load_chunk(
 // second weight matrix (gate, same layout and strides) is dotted against the same activations, gate_bias is added to
 // it and the GLU op combines the two. Without fusion the epilogue is a plain store: a runtime bias check there costs
 // the 8-column verify kernel ~12% on H200.
-template <int ncols, bool has_fusion, bool has_gate, int rows = PQ2_0_MC_ROWS, int nwarps = PQ2_0_MC_WARPS, int splitk = 1, int unroll = 1>
+template <int ncols, bool has_fusion, bool has_gate, int rows = PQ2_0_MC_ROWS, int nwarps = PQ2_0_MC_WARPS, int splitk = 1, int unroll = 1, bool aligned_soa = false>
 __global__ void __launch_bounds__(nwarps * 32, 3)
-mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
+mul_mat_vec_pq2_0_mc(const void * vx_, const half * vxd_, const void * vy_, float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        const float * x_bias, const void * vgate_, const float * gate_bias, const ggml_glu_op glu_op, const float glu_limit) {
+        const float * x_bias, const void * vgate_, const half * vgated_, const float * gate_bias, const ggml_glu_op glu_op, const float glu_limit) {
     static_assert(unroll == 1 || !has_gate, "unroll is not implemented for the fused gate variant");
     static_assert(nwarps % splitk == 0, "splitk must divide nwarps");
     static_assert(splitk == 1 || !has_gate, "split-K is not implemented for the fused gate variant");
@@ -92,9 +178,9 @@ mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
 #pragma unroll
                 for (int r = 0; r < rows; ++r) {
                     const int row = min(row0 + r, nrows_x - 1); // clamped rows are computed but not stored
-                    pq2_0_mc_load_chunk(vx, row, stride_row_x, c, w0[u][r], w1[u][r], d2[u][r]);
+                    pq2_0_mc_load_chunk<aligned_soa>(vx, vxd_, row, stride_row_x, c, w0[u][r], w1[u][r], d2[u][r]);
                     if constexpr (has_gate) {
-                        pq2_0_mc_load_chunk(vgate, row, stride_row_x, c, g0[r], g1[r], e2[r]);
+                        pq2_0_mc_load_chunk<aligned_soa>(vgate, vgated_, row, stride_row_x, c, g0[r], g1[r], e2[r]);
                     }
                 }
 #pragma unroll
@@ -237,21 +323,55 @@ static void mul_mat_vec_pq2_0_mc_launch_rows(
     const dim3 block_nums((ngroups + groups_per_cta - 1) / groups_per_cta, 1, 1);
     const dim3 block_dims(nwarps * WARP_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    const bool use_soa = pq2_0_align_cache_enabled();
+    pq2_0_soa_entry x_soa{}, g_soa{};
+    bool soa_ok = false;
+    if (use_soa) {
+        x_soa = get_or_repack_pq2_soa(vx, nrows_x, stride_row_x, stream);
+        soa_ok = (x_soa.qs != nullptr);
+        if (soa_ok && fusion.gate) {
+            g_soa = get_or_repack_pq2_soa(fusion.gate, nrows_x, stride_row_x, stream);
+            soa_ok = (g_soa.qs != nullptr);
+        }
+    }
+
     if constexpr (splitk == 1 && unroll == 1) {
         if (fusion.gate) {
-            ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, true, rows, nwarps, splitk, unroll>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-                (const float *) fusion.x_bias, fusion.gate, (const float *) fusion.gate_bias, fusion.glu_op, fusion.glu_limit);
+            if (soa_ok) {
+                ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, true, rows, nwarps, splitk, unroll, true>, lp,
+                    x_soa.qs, x_soa.d, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                    (const float *) fusion.x_bias, g_soa.qs, g_soa.d, (const float *) fusion.gate_bias, fusion.glu_op, fusion.glu_limit);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, true, rows, nwarps, splitk, unroll, false>, lp,
+                    vx, nullptr, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                    (const float *) fusion.x_bias, fusion.gate, nullptr, (const float *) fusion.gate_bias, fusion.glu_op, fusion.glu_limit);
+            }
             return;
         }
     } else {
         GGML_ASSERT(!fusion.gate);
     }
     if (fusion.x_bias) {
-        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, false, rows, nwarps, splitk, unroll>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-            (const float *) fusion.x_bias, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
+        if (soa_ok) {
+            ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, false, rows, nwarps, splitk, unroll, true>, lp,
+                x_soa.qs, x_soa.d, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                (const float *) fusion.x_bias, nullptr, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, false, rows, nwarps, splitk, unroll, false>, lp,
+                vx, nullptr, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                (const float *) fusion.x_bias, nullptr, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
+        }
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, false, false, rows, nwarps, splitk, unroll>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
-            nullptr, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
+        if (soa_ok) {
+            ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, false, false, rows, nwarps, splitk, unroll, true>, lp,
+                x_soa.qs, x_soa.d, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                nullptr, nullptr, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, false, false, rows, nwarps, splitk, unroll, false>, lp,
+                vx, nullptr, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                nullptr, nullptr, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
+        }
     }
 }
 
@@ -266,20 +386,18 @@ static void mul_mat_vec_pq2_0_mc_launch(const void *                            
                                         const int                               stride_col_dst,
                                         cudaStream_t                            stream,
                                         const ggml_cuda_mm_fusion_args_device & fusion) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool turing_tune = [] { const char * e = getenv("GGML_CUDA_PQ2_TURING_TUNE"); return e != nullptr && atoi(e) != 0; }();
     if constexpr (ncols == 1) {
-        // Smaller Hopper projections need more CTAs; keep four-row reuse for the vocabulary head.
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        // Opt-in split-K for the two tall ffn_down shapes on Hopper (plain mat-vec only, not the gate variant):
-        // 2 rows per group, 2 warps per group, 8 warps per CTA. The K sum of a row is split in two halves, so the
-        // float summation order (and the output bits) differ from the default path. GGML_CUDA_PQ2_SPLITK=1; default off.
+        // Smaller Hopper/Turing projections need more CTAs; keep four-row reuse for the vocabulary head.
         static const bool splitk_env = [] { const char * e = getenv("GGML_CUDA_PQ2_SPLITK"); return e != nullptr && atoi(e) != 0; }();
-        if (cc == GGML_CUDA_CC_HOPPER && splitk_env && !fusion.gate &&
+        if ((cc == GGML_CUDA_CC_HOPPER || (cc == GGML_CUDA_CC_TURING && turing_tune)) && splitk_env && !fusion.gate &&
                 ((ncols_x == 12288 && nrows_x == 4096) || (ncols_x == 17408 && nrows_x == 5120))) {
             mul_mat_vec_pq2_0_mc_launch_rows<ncols, 2, 8, 2>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
                                                              stride_col_dst, stream, fusion);
             return;
         }
-        if (cc == GGML_CUDA_CC_HOPPER && nrows_x <= 17408) {
+        if ((cc == GGML_CUDA_CC_HOPPER || (cc == GGML_CUDA_CC_TURING && turing_tune)) && nrows_x <= 17408) {
             mul_mat_vec_pq2_0_mc_launch_rows<ncols, 2>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
                                                        stride_col_dst, stream, fusion);
             return;

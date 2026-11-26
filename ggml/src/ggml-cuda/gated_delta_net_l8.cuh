@@ -7,7 +7,7 @@
 // Adapted from ArthurOstapenko's Yukon CUDA GDN verification kernel:
 // https://github.com/Layr-Labs/cudafast-bonsai2-9b-engine/tree/36c95362b23b83724503fef4e88e61d748f9355f
 static constexpr int GDN_L8_ROWS        = 16;
-static constexpr int GDN_L8V_MIN_TOKENS = 8;
+static constexpr int GDN_L8V_MIN_TOKENS = 4;
 static constexpr int GDN_L8V_MAX_TOKENS = 16;
 
 // Preserve the original xor-16,8,4,2,1 reduction tree across four old lanes per new lane.
@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(128, 6) gated_delta_net_l8v_cuda(const float *
                                                                    int             K,
                                                                    const int32_t * s_ids,
                                                                    int64_t         s_row_stride) {
-#    if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#    if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     constexpr int  S_v      = 128;
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -98,10 +98,16 @@ __global__ void __launch_bounds__(128, 6) gated_delta_net_l8v_cuda(const float *
             } else {
                 continue;  // padding
             }
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
             const unsigned int dst = (unsigned int) __cvta_generic_to_shared(&stage[t][dst_i]);
             asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst), "l"(src));
+#        else
+            stage[t][dst_i] = *src;
+#        endif
         }
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
         asm volatile("cp.async.commit_group;");
+#        endif
     }
 
     float s[GDN_L8_ROWS];  // s[m*4 + r] = S[r*32 + n + 8m][my_col]
@@ -115,7 +121,9 @@ __global__ void __launch_bounds__(128, 6) gated_delta_net_l8v_cuda(const float *
             }
         }
     }
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     asm volatile("cp.async.wait_all;");
+#        endif
     __syncthreads();
 
     float g_lane = 0.0f, beta_lane = 0.0f;

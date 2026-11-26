@@ -79,7 +79,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     // planes 2..n_rs_seq are not allocated. The snapshot path keeps the full (1 + n_rs_seq)-plane layout.
     {
         const char * env = getenv("LLAMA_GDN_REPLAY");
-        bool on = !(env && atoi(env) == 0) && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 && offload &&
+        bool on = !(env && atoi(env) == 0) && n_rs_seq > 0 && n_seq_max >= 1 && mem_size == n_seq_max && offload &&
                   model.arch == LLM_ARCH_QWEN35 && type_s == GGML_TYPE_F32 &&
                   getenv("GGML_SYCL_GDN_CHUNKED") == nullptr; // the opt-in chunked prefill has no replay variant
         const uint32_t S = hparams.ssm_d_state;
@@ -96,7 +96,8 @@ llama_memory_recurrent::llama_memory_recurrent(
             any = true;
             ggml_backend_dev_t dev = model.dev_layer(i);
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            on = reg && strcmp(ggml_backend_reg_name(reg), "SYCL") == 0;
+            on = reg && (strcmp(ggml_backend_reg_name(reg), "SYCL") == 0 ||
+                         strcmp(ggml_backend_reg_name(reg), "CUDA") == 0);
         }
         rpl   = on && any;
         rpl_R = rpl ? R : 0;

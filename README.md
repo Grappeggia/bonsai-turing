@@ -1,3 +1,16 @@
+# bonsai-turing (llama.cpp for Ternary Bonsai 2.5 on NVIDIA Turing / RTX 8000)
+
+> [!TIP]
+> **See [BONSAI_TURING.md](BONSAI_TURING.md)** for full architecture notes, quality/LoRA benchmarks, build flags, and launch commands.
+>
+> On a single **Quadro RTX 8000 (`sm_75`, 48 GB, 1260 MHz / 200 W)** running `Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf`:
+> - **Prefill (`pp2048`):** **`3,008.5 tok/s`** (`8.9×` vs stock `ub=512`, `3.8×` vs `ub=2048`)
+> - **Single-Stream Lossless MTP Decode:** **`311.6 tok/s`** (JSON `n=15`) / **`123.9 tok/s`** (Code `n=7`)
+> - **Multi-Agent Steady-State Decode:** **`922.8 tok/s`** (100% lossless `-np 32 n=15`) / **`1,114–1,220 tok/s`** (opt-in INT4 `N>=256`, `-np 16..24 n=15`)
+> - **Quality & LoRA Parity:** Lossless INT8 (`-0.06%` PPL, `99.99%` logit corr, `100%` LoRA parity); opt-in INT4 (`+3.80%` PPL, `1089/1089` exact code match, `100%` LoRA parity).
+
+---
+
 # llama.cpp
 
 > [!IMPORTANT]

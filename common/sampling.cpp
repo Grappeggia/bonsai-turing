@@ -114,6 +114,37 @@ struct ring_buffer {
 // (make_heap on the first k, replace the heap top by every larger logit in index order, sort_heap) so that tokens with
 // equal logits end up in the same order as with llama_sampler_top_k.
 static void topk_from_logits(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    if (k == 1) {
+        int32_t best_id = 0;
+        float best_val = logits[0];
+        constexpr int32_t BLOCK = 32;
+        int32_t i = 1;
+        for (; i + BLOCK <= n_vocab; i += BLOCK) {
+            int any = 0;
+            for (int32_t j = 0; j < BLOCK; j++) {
+                any |= (int) (logits[i + j] > best_val);
+            }
+            if (!any) {
+                continue;
+            }
+            for (int32_t j = 0; j < BLOCK; j++) {
+                if (logits[i + j] > best_val) {
+                    best_val = logits[i + j];
+                    best_id = i + j;
+                }
+            }
+        }
+        for (; i < n_vocab; i++) {
+            if (logits[i] > best_val) {
+                best_val = logits[i];
+                best_id = i;
+            }
+        }
+        out.resize(1);
+        out[0] = llama_token_data{ best_id, best_val, 0.0f };
+        return;
+    }
+
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit > b.logit;
     };
@@ -347,6 +378,9 @@ static int32_t common_sampler_fast_topk(const common_params_sampling & params, b
     for (const auto cnstr : params.samplers) {
         switch (cnstr) {
             case COMMON_SAMPLER_TYPE_TOP_K:
+                if (params.temp <= 0.0f && params.n_probs == 0 && margin == 0) {
+                    return 1;
+                }
                 return params.top_k + margin;
             case COMMON_SAMPLER_TYPE_PENALTIES:
                 if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
@@ -833,6 +867,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // Zero-copy GPU greedy argmax fast path (bit-exact with CPU argmax; skips 64..512 MB DtoH + row swaps!)
+    if (gsmpl->fast_topk == 1 && gsmpl->fast_topk_mask.empty() &&
+            !grammar_should_apply(gsmpl) &&
+            !(rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING)) {
+        const llama_token gid = llama_get_gpu_argmax_ith(ctx, idx);
+        if (gid != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{ gid, 0.0f, 1.0f };
+            cur_p = { gsmpl->cur.data(), 1, 0, true };
+            return gid;
+        }
+    }
 
     // top-k directly from the logits when nothing before the top-k sampler reads the full array
     bool fast = gsmpl->fast_topk > 0 &&

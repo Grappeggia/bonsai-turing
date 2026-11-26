@@ -189,7 +189,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
+    static const bool turing_64 = getenv("GGML_CUDA_FA_TURING_64") != nullptr && atoi(getenv("GGML_CUDA_FA_TURING_64")) != 0;
+    if (Q->ne[1] <= 32/ncols2 || (!turing_64 && GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_KV>(ctx, dst);
         return;
@@ -273,8 +274,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // gqa_ratio 6 (e.g. 24 Q heads on 4 KV heads): with ncols2 = 8 two of the eight head slots of every MMA tile are padding (25 % of the MMA work).
     // For many query tokens (prompt processing) that waste outweighs the repeated K/V loads of ncols2 = 2; for few tokens (decode, MTP verify) it does not.
+    static const int gqa6_nc2 = []() {
+        const char * v = getenv("GGML_CUDA_FA_GQA6_NCOLS2");
+        return v != nullptr ? atoi(v) : 2;
+    }();
     if (use_gqa_opt && gqa_ratio == 6 && Q->ne[1] >= 64) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
+        if (gqa6_nc2 == 8) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
+        }
         return;
     }
 

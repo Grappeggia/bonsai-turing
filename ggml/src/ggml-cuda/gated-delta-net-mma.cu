@@ -6,16 +6,31 @@
 
 namespace ggml_cuda_gated_delta_net_mma {
 constexpr int D = 128;
-using bf16      = nv_bfloat16;
+#if defined(AMPERE_MMA_AVAILABLE) || defined(GGML_USE_HIP)
+using mma_f16   = nv_bfloat16;
+using mma_f16_2 = nv_bfloat162;
+static __device__ __forceinline__ mma_f16_2 f2_to_mma(float2 x) { return __float22bfloat162_rn(x); }
+static __device__ __forceinline__ float2    mma_to_f2(mma_f16_2 h) { return __bfloat1622float2(h); }
+static __device__ __forceinline__ mma_f16   f1_to_mma(float x) { return __float2bfloat16(x); }
+static __device__ __forceinline__ float     mma_to_f1(mma_f16 h) { return __bfloat162float(h); }
+#else
+using mma_f16   = half;
+using mma_f16_2 = half2;
+static __device__ __forceinline__ mma_f16_2 f2_to_mma(float2 x) { return __float22half2_rn(x); }
+static __device__ __forceinline__ float2    mma_to_f2(mma_f16_2 h) { return __half22float2(h); }
+static __device__ __forceinline__ mma_f16   f1_to_mma(float x) { return __float2half(x); }
+static __device__ __forceinline__ float     mma_to_f1(mma_f16 h) { return __half2float(h); }
+#endif
 
-template <int R, int C> struct matrix {
-    bf16 hi[R * C], lo[R * C];
+template <int R, int C, bool FAST_F16 = false> struct alignas(16) matrix {
+    alignas(16) mma_f16 hi[R * C];
+    alignas(16) mma_f16 lo[FAST_F16 ? 8 : R * C];
 
     static __device__ __forceinline__ int index(int r, int c) {
 #ifdef GGML_USE_HIP
         return r * C + c;
 #else
-        return 2 * ggml_cuda_mma::swizzle<C / 2, nv_bfloat162>(r * (C / 2) + c / 2, r) + c % 2;
+        return 2 * ggml_cuda_mma::swizzle<C / 2, mma_f16_2>(r * (C / 2) + c / 2, r) + c % 2;
 #endif // GGML_USE_HIP
     }
 
@@ -24,31 +39,35 @@ template <int R, int C> struct matrix {
         store(r, c, x.x);
         store(r, c + 1, x.y);
 #else
-        const int    i                            = index(r, c);
-        const auto   h                            = __float22bfloat162_rn(x);
-        const float2 rounded                      = __bfloat1622float2(h);
-        *reinterpret_cast<nv_bfloat162 *>(hi + i) = h;
-        *reinterpret_cast<nv_bfloat162 *>(lo + i) =
-            __float22bfloat162_rn(make_float2(x.x - rounded.x, x.y - rounded.y));
+        const int       i                         = index(r, c);
+        const mma_f16_2 h                         = f2_to_mma(x);
+        *reinterpret_cast<mma_f16_2 *>(hi + i)    = h;
+        if constexpr (!FAST_F16) {
+            const float2 rounded                  = mma_to_f2(h);
+            *reinterpret_cast<mma_f16_2 *>(lo + i) =
+                f2_to_mma(make_float2(x.x - rounded.x, x.y - rounded.y));
+        }
 #endif // GGML_USE_MUSA
     }
 
     __device__ __forceinline__ void store(int r, int c, float x) {
-        const int  i = index(r, c);
-        const bf16 h = __float2bfloat16(x);
-        hi[i]        = h;
-        lo[i]        = __float2bfloat16(x - __bfloat162float(h));
+        const int     i = index(r, c);
+        const mma_f16 h = f1_to_mma(x);
+        hi[i]           = h;
+        if constexpr (!FAST_F16) {
+            lo[i]       = f1_to_mma(x - mma_to_f1(h));
+        }
     }
 };
 
-template <int C, int V> struct alignas(128) shared {
-    matrix<C, D> q, k;
-    matrix<C, C> p, inverse;
-    matrix<C, V> delta;
+template <int C, int V, bool FAST_F16 = false> struct alignas(128) shared {
+    matrix<C, D, FAST_F16> q, k;
+    matrix<C, C, FAST_F16> p, inverse;
+    matrix<C, V, FAST_F16> delta;
 
     union {
-        matrix<D, V> state;
-        matrix<C, V> solved;
+        matrix<D, V, FAST_F16> state;
+        matrix<C, V, FAST_F16> solved;
     } scratch;
 
     float lower[C * C], prefix[C], beta[C];
@@ -56,32 +75,32 @@ template <int C, int V> struct alignas(128) shared {
     static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
 };
 
-#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#if defined(AMPERE_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 using namespace ggml_cuda_mma;
 #ifdef GGML_USE_HIP
 using acc    = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
-using a_tile = tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+using a_tile = tile<16, 8, mma_f16_2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
 using b_tile = a_tile;
 #else
 using acc    = tile<16, 8, float>;
-using a_tile = tile<16, 8, nv_bfloat162>;
-using b_tile = tile<8, 8, nv_bfloat162>;
+using a_tile = tile<16, 8, mma_f16_2>;
+using b_tile = tile<8, 8, mma_f16_2>;
 #endif // GGML_USE_HIP
 
-template <class tile_t, bool TRANS, int R, int C>
-__device__ __forceinline__ tile_t load(const matrix<R, C> & m, int row, int col, bool low) {
-    tile_t       t;
-    const bf16 * data = low ? m.lo : m.hi;
+template <class tile_t, bool TRANS, int R, int C, bool FAST_F16>
+__device__ __forceinline__ tile_t load(const matrix<R, C, FAST_F16> & m, int row, int col, bool low) {
+    tile_t          t;
+    const mma_f16 * data = low ? m.lo : m.hi;
 #ifdef GGML_USE_HIP
 #pragma unroll
     for (int i = 0; i < tile_t::ne; ++i) {
-        const int  r = row + tile_t::get_i(i), c = col + 2 * tile_t::get_j(i);
-        const bf16 x = data[TRANS ? m.index(c, r) : m.index(r, c)];
-        const bf16 y = data[TRANS ? m.index(c + 1, r) : m.index(r, c + 1)];
-        t.x[i]       = __float22bfloat162_rn(make_float2(__bfloat162float(x), __bfloat162float(y)));
+        const int     r = row + tile_t::get_i(i), c = col + 2 * tile_t::get_j(i);
+        const mma_f16 x = data[TRANS ? m.index(c, r) : m.index(r, c)];
+        const mma_f16 y = data[TRANS ? m.index(c + 1, r) : m.index(r, c + 1)];
+        t.x[i]          = f2_to_mma(make_float2(mma_to_f1(x), mma_to_f1(y)));
     }
 #else
-    const auto * packed = reinterpret_cast<const nv_bfloat162 *>(data);
+    const auto * packed = reinterpret_cast<const mma_f16_2 *>(data);
     if constexpr (TRANS) {
         load_ldmatrix_trans_swizzled<C / 2>(t, packed, col * (C / 2) + row / 2);
     } else {
@@ -91,22 +110,40 @@ __device__ __forceinline__ tile_t load(const matrix<R, C> & m, int row, int col,
     return t;
 }
 
-// B is addressed as B-transpose. Preserve both BF16 first-order residual terms.
-template <int K, bool TA = false, bool TB = false, int AR, int AC, int BR, int BC>
-__device__ __forceinline__ void product(acc & c, const matrix<AR, AC> & a, const matrix<BR, BC> & b, int row, int col) {
+// B is addressed as B-transpose. Preserve both FP16/BF16 first-order residual terms unless FAST_F16 is enabled.
+template <int K, bool TA = false, bool TB = false, bool FAST_F16 = false, int AR, int AC, int BR, int BC>
+__device__ __forceinline__ void product(acc & c, const matrix<AR, AC, FAST_F16> & a, const matrix<BR, BC, FAST_F16> & b, int row, int col) {
 #pragma unroll
     for (int k = 0; k < K; k += 16) {
         const auto ah = load<a_tile, TA>(a, row, k, false);
-        const auto al = load<a_tile, TA>(a, row, k, true);
         const auto bh = load<b_tile, TB>(b, col, k, false);
-        const auto bl = load<b_tile, TB>(b, col, k, true);
-        mma(c, al, bh);
-        mma(c, ah, bl);
+        if constexpr (!FAST_F16) {
+            const auto al = load<a_tile, TA>(a, row, k, true);
+            const auto bl = load<b_tile, TB>(b, col, k, true);
+            mma(c, al, bh);
+            mma(c, ah, bl);
+        }
         mma(c, ah, bh);
     }
 }
 
-template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, const acc & x, int r, int c) {
+// Lower-triangular product (a[row..row+15, k..k+15] is zero for k > row): skips 37.5% of K-tiles bit-exactly!
+template <int K, bool TA = false, bool TB = false, bool FAST_F16 = false, int AR, int AC, int BR, int BC>
+__device__ __forceinline__ void product_tril(acc & c, const matrix<AR, AC, FAST_F16> & a, const matrix<BR, BC, FAST_F16> & b, int row, int col) {
+    for (int k = 0; k <= row; k += 16) {
+        const auto ah = load<a_tile, TA>(a, row, k, false);
+        const auto bh = load<b_tile, TB>(b, col, k, false);
+        if constexpr (!FAST_F16) {
+            const auto al = load<a_tile, TA>(a, row, k, true);
+            const auto bl = load<b_tile, TB>(b, col, k, true);
+            mma(c, al, bh);
+            mma(c, ah, bl);
+        }
+        mma(c, ah, bh);
+    }
+}
+
+template <int R, int C, bool FAST_F16> __device__ __forceinline__ void store(matrix<R, C, FAST_F16> & m, const acc & x, int r, int c) {
 #pragma unroll
 #ifdef GGML_USE_HIP
     for (int i = 0; i < acc::ne; ++i) {
@@ -122,9 +159,9 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
 
 // Each block owns V independent value columns and advances by C tokens.
 // Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
-template <int C, int V, int BLOCKS = 1>
+template <int C, int V, int BLOCKS = 1, bool FAST_F16 = false>
 static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
-#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#if defined(AMPERE_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
     constexpr int WARPS = 8;
 #ifdef GGML_USE_HIP
@@ -134,7 +171,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #endif // GGML_USE_HIP
     static_assert(C >= 16 && (C & (C - 1)) == 0 && V % N == 0 && D % V == 0, "invalid GDN tile");
     extern __shared__ __align__(128) unsigned char bytes[];
-    auto &                                         s    = *reinterpret_cast<shared<C, V> *>(bytes);
+    auto &                                         s    = *reinterpret_cast<shared<C, V, FAST_F16> *>(bytes);
     const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
     const int                                      slice = blockIdx.x % (D / V);
     const int                                      h     = (blockIdx.x / (D / V)) % a.H;
@@ -232,20 +269,20 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         acc            base_output[((C / 16) * (V / N) + WARPS - 1) / WARPS];
         // delta = beta * (v - decay * K S), base output = decay * Q S
         auto           project = [&]() {
-            if constexpr (V == 32) {
+            if constexpr (SPLIT_PROJECTION) {
                 if (warp < 4) {
                     return;
                 }
             }
-            for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
+            for (int ti = (SPLIT_PROJECTION ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (SPLIT_PROJECTION ? 4 : WARPS)) {
                 const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
                 acc       qs, ks;
-                product<D, false, true>(qs, s.q, s.scratch.state, r, c);
-                product<D, false, true>(ks, s.k, s.scratch.state, r, c);
+                product<D, false, true, FAST_F16>(qs, s.q, s.scratch.state, r, c);
+                product<D, false, true, FAST_F16>(ks, s.k, s.scratch.state, r, c);
 #pragma unroll
                 for (int i = 0; i < acc::ne; ++i) {
                     const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
-                    const float decay = expf(s.prefix[t]);
+                    const float decay = FAST_F16 ? __expf(s.prefix[t]) : expf(s.prefix[t]);
                     const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
                     s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
                     base_output[ti / WARPS].x[i] = decay * qs.x[i];
@@ -253,19 +290,29 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             }
         };
         // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
-        for (int ti = warp; ti < 2 * (C / 16) * (C / N) && (V != 32 || warp < 4); ti += (V == 32 ? 4 : WARPS)) {
+        for (int ti = warp; ti < 2 * (C / 16) * (C / N) && (!SPLIT_PROJECTION || warp < 4); ti += (SPLIT_PROJECTION ? 4 : WARPS)) {
             const bool gram = ti < (C / 16) * (C / N);
             const int  t = ti % ((C / 16) * (C / N)), r = (t / (C / N)) * 16, c = (t % (C / N)) * N;
+            // Upper-triangle tiles (c >= r + 16) have cc > rr for every element -> skip product<D> completely (bit-exact)!
+            if (c >= r + 16) {
+                if (!gram) {
+#pragma unroll
+                    for (int i = 0; i < acc::ne; ++i) {
+                        s.p.store(r + acc::get_i(i), c + acc::get_j(i), 0.f);
+                    }
+                }
+                continue;
+            }
             acc        x;
             if (gram) {
-                product<D>(x, s.k, s.k, r, c);
+                product<D, false, false, FAST_F16>(x, s.k, s.k, r, c);
             } else {
-                product<D>(x, s.q, s.k, r, c);
+                product<D, false, false, FAST_F16>(x, s.q, s.k, r, c);
             }
 #pragma unroll
             for (int i = 0; i < acc::ne; ++i) {
                 const int   rr = r + acc::get_i(i), cc = c + acc::get_j(i);
-                const float v = rr < valid && cc <= rr ? x.x[i] * expf(s.prefix[rr] - s.prefix[cc]) : 0.f;
+                const float v = rr < valid && cc <= rr ? x.x[i] * (FAST_F16 ? __expf(s.prefix[rr] - s.prefix[cc]) : expf(s.prefix[rr] - s.prefix[cc])) : 0.f;
                 if (gram) {
                     if (cc < rr) {
                         s.lower[s.lower_index(rr, cc)] = v * s.beta[rr];
@@ -275,7 +322,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         }
-        if constexpr (V == 32) {
+        if constexpr (SPLIT_PROJECTION) {
             project();
         }
         __syncthreads();
@@ -304,7 +351,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 }
             }
         }
-        if constexpr (V != 32) {
+        if constexpr (!SPLIT_PROJECTION) {
             project();
         }
         __syncthreads();
@@ -312,7 +359,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         for (int ti = warp; ti < (C / 16) * (V / N); ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
-            product<C, false, true>(x, s.inverse, s.delta, r, c);
+            product<C, false, true, FAST_F16>(x, s.inverse, s.delta, r, c);
             store(s.scratch.solved, x, r, c);
         }
         __syncthreads();
@@ -321,7 +368,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
              ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
-            product<C, false, true>(x, s.p, s.scratch.solved, r, c);
+            product<C, false, true, FAST_F16>(x, s.p, s.scratch.solved, r, c);
 #pragma unroll
             for (int i = 0; i < acc::ne; ++i) {
                 const int t = r + acc::get_i(i), v = c + acc::get_j(i);
@@ -333,11 +380,11 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         // S = decay(chunk) * S + K^T * (solved * decay to chunk end)
         for (int i = tid; i < C * V; i += 256) {
             const int   t = i / V, v = i % V, j = s.scratch.solved.index(t, v);
-            const float x = __bfloat162float(s.scratch.solved.hi[j]) + __bfloat162float(s.scratch.solved.lo[j]);
-            s.delta.store(t, v, x * expf(s.prefix[valid - 1] - s.prefix[t]));
+            const float x = FAST_F16 ? mma_to_f1(s.scratch.solved.hi[j]) : (mma_to_f1(s.scratch.solved.hi[j]) + mma_to_f1(s.scratch.solved.lo[j]));
+            s.delta.store(t, v, x * (FAST_F16 ? __expf(s.prefix[valid - 1] - s.prefix[t]) : expf(s.prefix[valid - 1] - s.prefix[t])));
         }
         __syncthreads();
-        const float decay = expf(s.prefix[valid - 1]);
+        const float decay = FAST_F16 ? __expf(s.prefix[valid - 1]) : expf(s.prefix[valid - 1]);
 #pragma unroll
         for (int j = 0; j < PER_WARP; ++j) {
             const int ti = warp + j * WARPS, r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
@@ -345,7 +392,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             for (int i = 0; i < acc::ne; ++i) {
                 state[j].x[i] *= decay;
             }
-            product<C, true, true>(state[j], s.k, s.delta, r, c);
+            product<C, true, true, FAST_F16>(state[j], s.k, s.delta, r, c);
         }
         __syncthreads();
     }
@@ -363,16 +410,16 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 }
 
-template <int C, int V, int BLOCKS = 1> bool init(int device) {
+template <int C, int V, int BLOCKS = 1, bool FAST_F16 = false> bool init(int device) {
     static std::once_flag once[GGML_CUDA_MAX_DEVICES];
     static bool           available[GGML_CUDA_MAX_DEVICES] = {};
     std::call_once(once[device], [device] {
         ggml_cuda_set_device(device);
-        if (sizeof(shared<C, V>) > ggml_cuda_info().devices[device].smpbo) {
+        if (sizeof(shared<C, V, FAST_F16>) > ggml_cuda_info().devices[device].smpbo) {
             return;
         }
-        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V>));
+        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS, FAST_F16>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V, FAST_F16>));
         available[device] = status == cudaSuccess;
         if (status != cudaSuccess) {
             (void) cudaGetLastError();
@@ -381,7 +428,17 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
     return available[device];
 }
 
-enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
+static bool gdn_fast_f16_enabled() {
+    static const bool env = []() { const char * v = getenv("GGML_CUDA_GDN_FAST_F16"); return v != nullptr && atoi(v) != 0; }();
+    return env;
+}
+
+static bool gdn_c32_enabled() {
+    static const bool env = []() { const char * v = getenv("GGML_CUDA_GDN_C32"); return v != nullptr && atoi(v) != 0; }();
+    return env;
+}
+
+enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice32_c32, slice64, slice64_f16_2b, slice64_f16_1b, whole_head };
 
 static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
@@ -400,6 +457,26 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
     return gdn_path::ar;
 #else
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
+    if (info.cc == GGML_CUDA_CC_TURING) {
+        if (!turing_mma_available(info.cc)) {
+            return gdn_path::ar;
+        }
+        if (gdn_fast_f16_enabled()) {
+            if (gdn_c32_enabled() && a.n_tokens >= 128 && init<32, 32, 1, true>(device)) {
+                return gdn_path::slice32_c32;
+            }
+            if (a.H * a.n_seqs * 2 >= info.nsm) {
+                if (init<16, 64, 2, true>(device)) {
+                    return gdn_path::slice64_f16_2b;
+                }
+                if (init<16, 64, 1, true>(device)) {
+                    return gdn_path::slice64_f16_1b;
+                }
+            }
+            return init<16, 32, 2, true>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+        }
+        return init<16, 32, 1, false>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
+    }
     if (!ampere_mma_available(info.cc) ||
         (info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE && info.cc != GGML_CUDA_CC_HOPPER &&
          info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
@@ -428,6 +505,9 @@ bool ggml_cuda_gdn_mma_device_supported(int device) {
     return false;
 #else
     // the architectures select_gdn_mma_path accepts
+    if (cc == GGML_CUDA_CC_TURING) {
+        return turing_mma_available(cc);
+    }
     return ampere_mma_available(cc) && (cc == GGML_CUDA_CC_AMPERE_GA10X || cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER ||
                                         cc == GGML_CUDA_CC_BLACKWELL || cc == GGML_CUDA_CC_DGX_SPARK);
 #endif // GGML_USE_HIP
@@ -444,10 +524,20 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
 #ifdef GGML_USE_HIP
     gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
 #else
-    if (path == gdn_path::slice32_two_blocks) {
-        gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+    if (path == gdn_path::slice32_c32) {
+        gdn_single<32, 32, 1, true><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<32, 32, true>), stream>>>(a);
+    } else if (path == gdn_path::slice64_f16_2b) {
+        gdn_single<16, 64, 2, true><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64, true>), stream>>>(a);
+    } else if (path == gdn_path::slice64_f16_1b) {
+        gdn_single<16, 64, 1, true><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64, true>), stream>>>(a);
+    } else if (path == gdn_path::slice32_two_blocks) {
+        if (ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_TURING && gdn_fast_f16_enabled()) {
+            gdn_single<16, 32, 2, true><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32, true>), stream>>>(a);
+        } else {
+            gdn_single<16, 32, 2, false><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32, false>), stream>>>(a);
+        }
     } else if (path == gdn_path::slice32_one_block) {
-        gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+        gdn_single<16, 32, 1, false><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32, false>), stream>>>(a);
     } else {
         gdn_single<16, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
     }

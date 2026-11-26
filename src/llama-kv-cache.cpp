@@ -1305,7 +1305,21 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+static uint32_t kv_n_pad_adaptive(uint32_t n_pad, uint32_t used_p1, uint32_t cell_size) {
+    uint32_t p = std::max(n_pad, 256u);
+    if (cell_size >= 16384 && used_p1 > 1024) {
+        p = std::max(p, 4096u);
+    }
+    if (cell_size >= 32768 && used_p1 > 4096) {
+        p = std::max(p, 8192u);
+    }
+    return p;
+}
+
 uint32_t llama_kv_cache::get_n_kv_prefix(const slot_info & sinfo, uint32_t n_rows) const {
+    if (sinfo.n_stream() > 1) {
+        return get_n_kv(sinfo);
+    }
     GGML_ASSERT(sinfo.n_stream() == 1);
 
     const auto & cells = v_cells[sinfo.strm[0]];
@@ -1326,7 +1340,7 @@ uint32_t llama_kv_cache::get_n_kv_prefix(const slot_info & sinfo, uint32_t n_row
     }
 
     // same padding as get_n_kv
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad_cur = kv_n_pad_adaptive(n_pad, p1, cells.size());
 
     return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(p1, n_pad_cur)));
 }
@@ -1342,12 +1356,12 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
-
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
+        const uint32_t p1 = cells.used_max_p1();
+        const uint32_t n_pad_cur = kv_n_pad_adaptive(n_pad, p1, cells.size());
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(p1, n_pad_cur))), result);
     }
 
     return result;

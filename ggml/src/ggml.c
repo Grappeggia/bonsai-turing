@@ -6624,7 +6624,7 @@ struct ggml_tensor * ggml_gated_delta_net_replay(
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
 
     const int64_t R = H * (2 * S_v + 1);
-    GGML_ASSERT(rec->ne[0] == R * (K - 1) && rec->ne[1] == 2 && rec->ne[2] == n_seqs);
+    GGML_ASSERT(rec->ne[0] == R * (K - 1) && rec->ne[1] == 2 && rec->ne[2] >= n_seqs);
     GGML_ASSERT(rec->nb[0] == sizeof(float) && rec->nb[1] == (size_t) rec->ne[0] * sizeof(float));
     GGML_ASSERT(ggml_nelements(ctrl) == 2 * n_seqs);
 

@@ -1677,6 +1677,4348 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
+static bool ggml_cuda_pq2_cublas_i8_enabled() {
+    static const bool env = []() {
+        const char * v = getenv("GGML_CUDA_PQ2_CUBLAS_I8");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return env;
+}
+
+// =================================================================================================
+// Lossless Direct PQ2_0 (exact 2-bit ternary + exact per-128 half d) -> Turing m8n8k16 INT8 Tensor Core
+// Per-128-block INT8 activations [-127, +127]: 0.000 PPL degradation, 0.2656 B/w (6.46 GB) weight traffic!
+// =================================================================================================
+static bool ggml_cuda_pq2_narrow_int8_enabled() {
+    static const bool en = []() {
+        const char * v = getenv("GGML_CUDA_PQ2_NARROW_INT8");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
+// Prefill-only (N >= 256, M <= 65536) High-Precision INT4 via Turing m8n8k32 (217.5 TOPS):
+// Exact ternary weights + exact per-128 half d (reuses 6.46 GB A_qs/A_d cache) x per-128 RMS-clipped INT4 activations.
+static bool ggml_cuda_pq2_prefill_int4_enabled() {
+    static const bool en = []() {
+        const char * v = getenv("GGML_CUDA_PQ2_PREFILL_INT4");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
+static float ggml_cuda_pq2_prefill_int4_clip() {
+    static const float clip = []() {
+        const char * v = getenv("GGML_CUDA_PQ2_PREFILL_INT4_CLIP");
+        return v != nullptr ? (float) atof(v) : 2.35f;
+    }();
+    return clip;
+}
+
+__device__ __forceinline__ void pq2_mma_s4_m8n8k32(int32_t * d, uint32_t a, uint32_t b, const int32_t * c) {
+#if defined(TURING_MMA_AVAILABLE) || defined(AMPERE_MMA_AVAILABLE)
+    asm volatile(
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 "
+        "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
+        : "=r"(d[0]), "=r"(d[1])
+        : "r"(a), "r"(b), "r"(c[0]), "r"(c[1]));
+#else
+    GGML_UNUSED_VARS(d, a, b, c);
+#endif
+}
+
+__global__ static void repack_pq2_to_tc_i8_kernel(
+        const block_pq2_0 * __restrict__ src, uint2 * __restrict__ dst_qs, half * __restrict__ dst_d,
+        const int M, const int K) {
+    const int n_kblk = K >> 7;
+    const int rg = blockIdx.x;
+    const int kb = blockIdx.y;
+    const int lane = threadIdx.x; // 0..31
+    const int lane_r = lane >> 2; // 0..7
+    const int lane_k = lane & 3;  // 0..3
+    const int row = rg * 8 + lane_r;
+    if (row >= M) { return; }
+    const block_pq2_0 & blk = src[(int64_t) row * n_kblk + kb];
+    auto pack_pair = [&](int ks0, int ks1) -> uint32_t {
+        const int off0 = ks0 * 8 + lane_k * 2;
+        const int off1 = ks1 * 8 + lane_k * 2;
+        const uint16_t s0 = (uint16_t) blk.qs[off0] | ((uint16_t) blk.qs[off0 + 1] << 8);
+        const uint16_t s1 = (uint16_t) blk.qs[off1] | ((uint16_t) blk.qs[off1 + 1] << 8);
+        uint32_t w = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const uint32_t lo = (s0 >> (b * 4)) & 0xFu;
+            const uint32_t hi = (s1 >> (b * 4)) & 0xFu;
+            w |= (lo | (hi << 4)) << (b * 8);
+        }
+        return w;
+    };
+    dst_qs[((int64_t) rg * n_kblk + kb) * 32 + lane] = make_uint2(pack_pair(0, 1), pack_pair(2, 3));
+    if (lane_k == 0) {
+        dst_d[((int64_t) rg * n_kblk + kb) * 8 + lane_r] = blk.d;
+    }
+}
+
+struct pq2_tc_i8_entry {
+    uint2 * qs = nullptr;
+    half  * d  = nullptr;
+    int64_t M  = 0;
+    int64_t K  = 0;
+};
+
+static pq2_tc_i8_entry get_or_repack_pq2_tc_i8(
+        const block_pq2_0 * src0, const int64_t M, const int64_t K, cudaStream_t stream, bool allow_alloc) {
+    static std::mutex mu;
+    static std::unordered_map<const void *, pq2_tc_i8_entry> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(src0);
+    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+        return it->second;
+    }
+    if (!allow_alloc) {
+        return {};
+    }
+    const int64_t n_rg   = (M + 7) >> 3;
+    const int64_t n_kblk = K >> 7;
+    pq2_tc_i8_entry e;
+    e.M = M; e.K = K;
+    CUDA_CHECK(cudaMalloc(&e.qs, (size_t) n_rg * (size_t) n_kblk * 32 * sizeof(uint2)));
+    CUDA_CHECK(cudaMalloc(&e.d,  (size_t) n_rg * (size_t) n_kblk * 8  * sizeof(half)));
+    dim3 grid((unsigned) n_rg, (unsigned) n_kblk);
+    repack_pq2_to_tc_i8_kernel<<<grid, 32, 0, stream>>>(src0, e.qs, e.d, (int) M, (int) K);
+    CUDA_CHECK(cudaGetLastError());
+    cache[src0] = e;
+    return e;
+}
+
+// 1-pass ZERO-SMEM F32 -> exact 2-nibble INT8 [-120, +119] (b = 16*b_hi + b_lo) + per-128 B_sum + B_scales
+// Stored per 128-block as 16 uint32_t of b_hi followed by 16 uint32_t of b_lo (32 uint32_t/block).
+__global__ static void quantize_f32_to_i8_sum128_kernel(
+        const float * __restrict__ src1, uint32_t * __restrict__ dst_i8,
+        int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
+        const int N, const int N_pad, const int K, const int64_t s11) {
+    const int col = blockIdx.x;
+    if (col >= N_pad) { return; }
+    const int tid = threadIdx.x; // 0..511 (half-warp = 16 threads = 128 elements!)
+    const int K8 = K >> 3;
+    const int K4 = K >> 2;
+    const int n_kblk = K >> 7;
+    uint32_t * out32  = dst_i8        + (int64_t) col * K4;
+    int32_t  * out_s  = dst_sum128    + (int64_t) col * n_kblk;
+    float    * out_sc = dst_scales128 + (int64_t) col * n_kblk;
+    if (col >= N) {
+        for (int i = tid; i < K4; i += 512) { out32[i] = 0u; }
+        for (int i = tid; i < n_kblk; i += 512) { out_s[i] = 0; out_sc[i] = 0.0f; }
+        return;
+    }
+    const float4 * in4 = (const float4 *) (src1 + (int64_t) col * s11);
+    for (int i = tid; i < K8; i += 512) {
+        const float4 a = in4[2 * i + 0];
+        const float4 b = in4[2 * i + 1];
+        float bmax = fmaxf(
+            fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))),
+            fmaxf(fmaxf(fabsf(b.x), fabsf(b.y)), fmaxf(fabsf(b.z), fabsf(b.w))));
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) {
+            bmax = fmaxf(bmax, __shfl_xor_sync(0xFFFFFFFF, bmax, off));
+        }
+        const float inv_scale = bmax > 0.0f ? (119.0f / bmax) : 0.0f;
+        int q[8];
+        q[0] = max(-120, min(119, __float2int_rn(a.x * inv_scale)));
+        q[1] = max(-120, min(119, __float2int_rn(a.y * inv_scale)));
+        q[2] = max(-120, min(119, __float2int_rn(a.z * inv_scale)));
+        q[3] = max(-120, min(119, __float2int_rn(a.w * inv_scale)));
+        q[4] = max(-120, min(119, __float2int_rn(b.x * inv_scale)));
+        q[5] = max(-120, min(119, __float2int_rn(b.y * inv_scale)));
+        q[6] = max(-120, min(119, __float2int_rn(b.z * inv_scale)));
+        q[7] = max(-120, min(119, __float2int_rn(b.w * inv_scale)));
+        uint32_t w_hi = 0u, w_lo = 0u;
+        int s = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int lo = ((q[j] + 8) & 15) - 8;
+            const int hi = (q[j] - lo) >> 4;
+            w_hi |= ((uint32_t)(hi & 0xF)) << (j * 4);
+            w_lo |= ((uint32_t)(lo & 0xF)) << (j * 4);
+            s += q[j];
+        }
+        const int kb = i >> 4;
+        const int kw = ((i & 3) << 2) | ((i >> 2) & 3);
+        out32[(kb << 5) + kw]      = w_hi;
+        out32[(kb << 5) + 16 + kw] = w_lo;
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) {
+            s += __shfl_xor_sync(0xFFFFFFFF, s, off);
+        }
+        if ((tid & 15) == 0) {
+            out_s[kb]  = s;
+            out_sc[kb] = bmax / 119.0f;
+        }
+    }
+}
+
+template <int N_PAD, int WARPS, int R_TILES>
+__global__ static void __launch_bounds__(WARPS * 32)
+pq2_narrow_int8_v2_kernel(
+        const uint2    * __restrict__ A_qs,
+        const half     * __restrict__ A_d,
+        const uint32_t * __restrict__ B_i8,
+        const int32_t  * __restrict__ B_sum,
+        const float    * __restrict__ B_scales,
+        const float    * __restrict__ add_src,
+        float          * __restrict__ C,
+        const int M, const int N, const int K, const int64_t s_dst) {
+    constexpr int N_TILES = N_PAD / 8;
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int rg0  = (blockIdx.x * WARPS + warp) * R_TILES;
+    const int col_base = blockIdx.y * N_PAD;
+
+    const int n_kblk = K >> 7;
+    const int K4     = K >> 2;
+    const int n_sk   = gridDim.z;
+    const int sk_id  = blockIdx.z;
+    const int kb_per = (n_kblk + n_sk - 1) / n_sk;
+    const int kb_beg = sk_id * kb_per;
+    const int kb_end = min(n_kblk, kb_beg + kb_per);
+    if (kb_beg >= kb_end) { return; }
+
+    __shared__ uint32_t sB[2][N_PAD][33]; // [0..15] = b_hi, [16..31] = b_lo (+1 pad: zero bank conflicts!)
+    __shared__ int32_t  sBsum[2][N_PAD];
+    __shared__ float    sBsc[2][N_PAD];
+
+    float acc[R_TILES][N_TILES][2];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt)
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+            acc[rt][nt][0] = 0.0f;
+            acc[rt][nt][1] = 0.0f;
+        }
+
+    const int lane_r = lane >> 2;
+    const int lane_k = lane & 3;
+    const int c0_off = lane_k * 2;
+    const int c1_off = c0_off + 1;
+
+    constexpr int TOTAL_B_WORDS = N_PAD * 32;
+    constexpr int B_PER_THR     = (TOTAL_B_WORDS + WARPS * 32 - 1) / (WARPS * 32);
+    for (int idx = tid; idx < TOTAL_B_WORDS; idx += WARPS * 32) {
+        sB[0][idx >> 5][idx & 31] = B_i8[(int64_t)(col_base + (idx >> 5)) * K4 + (kb_beg << 5) + (idx & 31)];
+    }
+    if (tid < N_PAD) {
+        sBsum[0][tid] = B_sum[(int64_t)(col_base + tid) * n_kblk + kb_beg];
+        sBsc[0][tid]  = B_scales[(int64_t)(col_base + tid) * n_kblk + kb_beg];
+    }
+    __syncthreads();
+
+    uint2 uA[R_TILES];
+    float dA[R_TILES];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int rg = rg0 + rt;
+        if (rg * 8 < M) {
+            uA[rt] = A_qs[((int64_t) rg * n_kblk + kb_beg) * 32 + lane];
+            dA[rt] = __half2float(A_d[((int64_t) rg * n_kblk + kb_beg) * 8 + lane_r]);
+        } else {
+            uA[rt] = make_uint2(0u, 0u);
+            dA[rt] = 0.0f;
+        }
+    }
+
+    for (int kb = kb_beg; kb < kb_end; ++kb) {
+        const int cur = (kb - kb_beg) & 1;
+        const int nxt = cur ^ 1;
+        const bool has_nxt = (kb + 1 < kb_end);
+
+        uint32_t a0[R_TILES], a1[R_TILES], a2[R_TILES], a3[R_TILES];
+#pragma unroll
+        for (int rt = 0; rt < R_TILES; ++rt) {
+            a0[rt] = (uA[rt].x & 0x03030303u) | ((uA[rt].x & 0x0C0C0C0Cu) << 2);
+            a1[rt] = ((uA[rt].x >> 4) & 0x03030303u) | ((uA[rt].x >> 2) & 0x30303030u);
+            a2[rt] = (uA[rt].y & 0x03030303u) | ((uA[rt].y & 0x0C0C0C0Cu) << 2);
+            a3[rt] = ((uA[rt].y >> 4) & 0x03030303u) | ((uA[rt].y >> 2) & 0x30303030u);
+        }
+
+        // Software-pipeline NEXT k-block A_qs/A_d AND B_i8 loads into registers BEFORE MMAs!
+        uint2 uA_nxt[R_TILES];
+        float dA_nxt[R_TILES];
+        uint32_t gB[B_PER_THR];
+        int32_t  gBsum = 0;
+        float    gBsc  = 0.0f;
+        if (has_nxt) {
+            const int kb1 = kb + 1;
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                const int rg = rg0 + rt;
+                if (rg * 8 < M) {
+                    uA_nxt[rt] = A_qs[((int64_t) rg * n_kblk + kb1) * 32 + lane];
+                    dA_nxt[rt] = __half2float(A_d[((int64_t) rg * n_kblk + kb1) * 8 + lane_r]);
+                } else {
+                    uA_nxt[rt] = make_uint2(0u, 0u);
+                    dA_nxt[rt] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int bi = 0; bi < B_PER_THR; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_B_WORDS) {
+                    gB[bi] = B_i8[(int64_t)(col_base + (idx >> 5)) * K4 + (kb1 << 5) + (idx & 31)];
+                }
+            }
+            if (tid < N_PAD) {
+                gBsum = B_sum[(int64_t)(col_base + tid) * n_kblk + kb1];
+                gBsc  = B_scales[(int64_t)(col_base + tid) * n_kblk + kb1];
+            }
+        }
+
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+            const int b_col = nt * 8 + lane_r;
+            const uint32_t bh0 = sB[cur][b_col][(lane_k << 2) + 0];
+            const uint32_t bh1 = sB[cur][b_col][(lane_k << 2) + 1];
+            const uint32_t bh2 = sB[cur][b_col][(lane_k << 2) + 2];
+            const uint32_t bh3 = sB[cur][b_col][(lane_k << 2) + 3];
+            const uint32_t bl0 = sB[cur][b_col][16 + (lane_k << 2) + 0];
+            const uint32_t bl1 = sB[cur][b_col][16 + (lane_k << 2) + 1];
+            const uint32_t bl2 = sB[cur][b_col][16 + (lane_k << 2) + 2];
+            const uint32_t bl3 = sB[cur][b_col][16 + (lane_k << 2) + 3];
+            const int32_t bs0 = sBsum[cur][nt * 8 + c0_off];
+            const int32_t bs1 = sBsum[cur][nt * 8 + c1_off];
+            const float bsc0  = sBsc[cur][nt * 8 + c0_off];
+            const float bsc1  = sBsc[cur][nt * 8 + c1_off];
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                int32_t dhi[2] = { 0, 0 }, dlo[2] = { 0, 0 };
+                pq2_mma_s4_m8n8k32(dhi, a0[rt], bh0, dhi);
+                pq2_mma_s4_m8n8k32(dhi, a1[rt], bh1, dhi);
+                pq2_mma_s4_m8n8k32(dhi, a2[rt], bh2, dhi);
+                pq2_mma_s4_m8n8k32(dhi, a3[rt], bh3, dhi);
+                pq2_mma_s4_m8n8k32(dlo, a0[rt], bl0, dlo);
+                pq2_mma_s4_m8n8k32(dlo, a1[rt], bl1, dlo);
+                pq2_mma_s4_m8n8k32(dlo, a2[rt], bl2, dlo);
+                pq2_mma_s4_m8n8k32(dlo, a3[rt], bl3, dlo);
+                acc[rt][nt][0] = fmaf((float)((dhi[0] << 4) + dlo[0] - bs0), dA[rt] * bsc0, acc[rt][nt][0]);
+                acc[rt][nt][1] = fmaf((float)((dhi[1] << 4) + dlo[1] - bs1), dA[rt] * bsc1, acc[rt][nt][1]);
+            }
+        }
+
+        if (has_nxt) {
+#pragma unroll
+            for (int bi = 0; bi < B_PER_THR; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_B_WORDS) {
+                    sB[nxt][idx >> 5][idx & 31] = gB[bi];
+                }
+            }
+            if (tid < N_PAD) {
+                sBsum[nxt][tid] = gBsum;
+                sBsc[nxt][tid]  = gBsc;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                uA[rt] = uA_nxt[rt];
+                dA[rt] = dA_nxt[rt];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int out_row = (rg0 + rt) * 8 + lane_r;
+        if (out_row < M) {
+#pragma unroll
+            for (int nt = 0; nt < N_TILES; ++nt) {
+                const int col0 = col_base + nt * 8 + c0_off;
+                const int col1 = col_base + nt * 8 + c1_off;
+                if (col0 < N) {
+                    float v = acc[rt][nt][0];
+                    if (n_sk == 1) {
+                        if (add_src) { v += add_src[(int64_t) col0 * s_dst + out_row]; }
+                        C[(int64_t) col0 * s_dst + out_row] = v;
+                    } else {
+                        atomicAdd(&C[(int64_t) col0 * s_dst + out_row], v);
+                    }
+                }
+                if (col1 < N) {
+                    float v = acc[rt][nt][1];
+                    if (n_sk == 1) {
+                        if (add_src) { v += add_src[(int64_t) col1 * s_dst + out_row]; }
+                        C[(int64_t) col1 * s_dst + out_row] = v;
+                    } else {
+                        atomicAdd(&C[(int64_t) col1 * s_dst + out_row], v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int N_PAD, int WARPS, int R_TILES>
+__global__ static void __launch_bounds__(WARPS * 32)
+pq2_narrow_int8_swiglu_v2_kernel(
+        const uint2    * __restrict__ G_qs,
+        const half     * __restrict__ G_d,
+        const uint2    * __restrict__ U_qs,
+        const half     * __restrict__ U_d,
+        const uint32_t * __restrict__ B_i8,
+        const int32_t  * __restrict__ B_sum,
+        const float    * __restrict__ B_scales,
+        float          * __restrict__ C,
+        const int M, const int N, const int K, const int64_t s_dst) {
+    constexpr int N_TILES = N_PAD / 8;
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int rg0  = (blockIdx.x * WARPS + warp) * R_TILES;
+    const int col_base = blockIdx.y * N_PAD;
+
+    const int n_kblk = K >> 7;
+    const int K4     = K >> 2;
+    __shared__ uint32_t sB[2][N_PAD][33];
+    __shared__ int32_t  sBsum[2][N_PAD];
+    __shared__ float    sBsc[2][N_PAD];
+
+    float acc_g[R_TILES][N_TILES][2];
+    float acc_u[R_TILES][N_TILES][2];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt)
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+            acc_g[rt][nt][0] = 0.0f; acc_g[rt][nt][1] = 0.0f;
+            acc_u[rt][nt][0] = 0.0f; acc_u[rt][nt][1] = 0.0f;
+        }
+
+    const int lane_r = lane >> 2;
+    const int lane_k = lane & 3;
+    const int c0_off = lane_k * 2;
+    const int c1_off = c0_off + 1;
+
+    constexpr int TOTAL_B_WORDS = N_PAD * 32;
+    constexpr int B_PER_THR     = (TOTAL_B_WORDS + WARPS * 32 - 1) / (WARPS * 32);
+    for (int idx = tid; idx < TOTAL_B_WORDS; idx += WARPS * 32) {
+        sB[0][idx >> 5][idx & 31] = B_i8[(int64_t)(col_base + (idx >> 5)) * K4 + (idx & 31)];
+    }
+    if (tid < N_PAD) {
+        sBsum[0][tid] = B_sum[(int64_t)(col_base + tid) * n_kblk];
+        sBsc[0][tid]  = B_scales[(int64_t)(col_base + tid) * n_kblk];
+    }
+    __syncthreads();
+
+    uint2 uG[R_TILES], uU[R_TILES];
+    float dG[R_TILES], dU[R_TILES];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int rg = rg0 + rt;
+        if (rg * 8 < M) {
+            const int64_t qoff = ((int64_t) rg * n_kblk) * 32 + lane;
+            const int64_t doff = ((int64_t) rg * n_kblk) * 8 + lane_r;
+            uG[rt] = G_qs[qoff]; dG[rt] = __half2float(G_d[doff]);
+            uU[rt] = U_qs[qoff]; dU[rt] = __half2float(U_d[doff]);
+        } else {
+            uG[rt] = make_uint2(0u, 0u); dG[rt] = 0.0f;
+            uU[rt] = make_uint2(0u, 0u); dU[rt] = 0.0f;
+        }
+    }
+
+    for (int kb = 0; kb < n_kblk; ++kb) {
+        const int cur = kb & 1;
+        const int nxt = cur ^ 1;
+        const bool has_nxt = (kb + 1 < n_kblk);
+
+        uint32_t g0[R_TILES], g1[R_TILES], g2[R_TILES], g3[R_TILES];
+        uint32_t p0[R_TILES], p1[R_TILES], p2[R_TILES], p3[R_TILES];
+#pragma unroll
+        for (int rt = 0; rt < R_TILES; ++rt) {
+            g0[rt] = (uG[rt].x & 0x03030303u) | ((uG[rt].x & 0x0C0C0C0Cu) << 2);
+            g1[rt] = ((uG[rt].x >> 4) & 0x03030303u) | ((uG[rt].x >> 2) & 0x30303030u);
+            g2[rt] = (uG[rt].y & 0x03030303u) | ((uG[rt].y & 0x0C0C0C0Cu) << 2);
+            g3[rt] = ((uG[rt].y >> 4) & 0x03030303u) | ((uG[rt].y >> 2) & 0x30303030u);
+            p0[rt] = (uU[rt].x & 0x03030303u) | ((uU[rt].x & 0x0C0C0C0Cu) << 2);
+            p1[rt] = ((uU[rt].x >> 4) & 0x03030303u) | ((uU[rt].x >> 2) & 0x30303030u);
+            p2[rt] = (uU[rt].y & 0x03030303u) | ((uU[rt].y & 0x0C0C0C0Cu) << 2);
+            p3[rt] = ((uU[rt].y >> 4) & 0x03030303u) | ((uU[rt].y >> 2) & 0x30303030u);
+        }
+
+        uint2 uG_nxt[R_TILES], uU_nxt[R_TILES];
+        float dG_nxt[R_TILES], dU_nxt[R_TILES];
+        uint32_t gB[B_PER_THR];
+        int32_t  gBsum = 0;
+        float    gBsc  = 0.0f;
+        if (has_nxt) {
+            const int kb1 = kb + 1;
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                const int rg = rg0 + rt;
+                if (rg * 8 < M) {
+                    const int64_t qoff = ((int64_t) rg * n_kblk + kb1) * 32 + lane;
+                    const int64_t doff = ((int64_t) rg * n_kblk + kb1) * 8 + lane_r;
+                    uG_nxt[rt] = G_qs[qoff]; dG_nxt[rt] = __half2float(G_d[doff]);
+                    uU_nxt[rt] = U_qs[qoff]; dU_nxt[rt] = __half2float(U_d[doff]);
+                } else {
+                    uG_nxt[rt] = make_uint2(0u, 0u); dG_nxt[rt] = 0.0f;
+                    uU_nxt[rt] = make_uint2(0u, 0u); dU_nxt[rt] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int bi = 0; bi < B_PER_THR; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_B_WORDS) {
+                    gB[bi] = B_i8[(int64_t)(col_base + (idx >> 5)) * K4 + (kb1 << 5) + (idx & 31)];
+                }
+            }
+            if (tid < N_PAD) {
+                gBsum = B_sum[(int64_t)(col_base + tid) * n_kblk + kb1];
+                gBsc  = B_scales[(int64_t)(col_base + tid) * n_kblk + kb1];
+            }
+        }
+
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+            const int b_col = nt * 8 + lane_r;
+            const uint32_t bh0 = sB[cur][b_col][(lane_k << 2) + 0];
+            const uint32_t bh1 = sB[cur][b_col][(lane_k << 2) + 1];
+            const uint32_t bh2 = sB[cur][b_col][(lane_k << 2) + 2];
+            const uint32_t bh3 = sB[cur][b_col][(lane_k << 2) + 3];
+            const uint32_t bl0 = sB[cur][b_col][16 + (lane_k << 2) + 0];
+            const uint32_t bl1 = sB[cur][b_col][16 + (lane_k << 2) + 1];
+            const uint32_t bl2 = sB[cur][b_col][16 + (lane_k << 2) + 2];
+            const uint32_t bl3 = sB[cur][b_col][16 + (lane_k << 2) + 3];
+            const int32_t bs0 = sBsum[cur][nt * 8 + c0_off];
+            const int32_t bs1 = sBsum[cur][nt * 8 + c1_off];
+            const float bsc0  = sBsc[cur][nt * 8 + c0_off];
+            const float bsc1  = sBsc[cur][nt * 8 + c1_off];
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                int32_t dgh[2] = { 0, 0 }, dgl[2] = { 0, 0 };
+                pq2_mma_s4_m8n8k32(dgh, g0[rt], bh0, dgh);
+                pq2_mma_s4_m8n8k32(dgh, g1[rt], bh1, dgh);
+                pq2_mma_s4_m8n8k32(dgh, g2[rt], bh2, dgh);
+                pq2_mma_s4_m8n8k32(dgh, g3[rt], bh3, dgh);
+                pq2_mma_s4_m8n8k32(dgl, g0[rt], bl0, dgl);
+                pq2_mma_s4_m8n8k32(dgl, g1[rt], bl1, dgl);
+                pq2_mma_s4_m8n8k32(dgl, g2[rt], bl2, dgl);
+                pq2_mma_s4_m8n8k32(dgl, g3[rt], bl3, dgl);
+                acc_g[rt][nt][0] = fmaf((float)((dgh[0] << 4) + dgl[0] - bs0), dG[rt] * bsc0, acc_g[rt][nt][0]);
+                acc_g[rt][nt][1] = fmaf((float)((dgh[1] << 4) + dgl[1] - bs1), dG[rt] * bsc1, acc_g[rt][nt][1]);
+
+                int32_t duh[2] = { 0, 0 }, dul[2] = { 0, 0 };
+                pq2_mma_s4_m8n8k32(duh, p0[rt], bh0, duh);
+                pq2_mma_s4_m8n8k32(duh, p1[rt], bh1, duh);
+                pq2_mma_s4_m8n8k32(duh, p2[rt], bh2, duh);
+                pq2_mma_s4_m8n8k32(duh, p3[rt], bh3, duh);
+                pq2_mma_s4_m8n8k32(dul, p0[rt], bl0, dul);
+                pq2_mma_s4_m8n8k32(dul, p1[rt], bl1, dul);
+                pq2_mma_s4_m8n8k32(dul, p2[rt], bl2, dul);
+                pq2_mma_s4_m8n8k32(dul, p3[rt], bl3, dul);
+                acc_u[rt][nt][0] = fmaf((float)((duh[0] << 4) + dul[0] - bs0), dU[rt] * bsc0, acc_u[rt][nt][0]);
+                acc_u[rt][nt][1] = fmaf((float)((duh[1] << 4) + dul[1] - bs1), dU[rt] * bsc1, acc_u[rt][nt][1]);
+            }
+        }
+
+        if (has_nxt) {
+#pragma unroll
+            for (int bi = 0; bi < B_PER_THR; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_B_WORDS) {
+                    sB[nxt][idx >> 5][idx & 31] = gB[bi];
+                }
+            }
+            if (tid < N_PAD) {
+                sBsum[nxt][tid] = gBsum;
+                sBsc[nxt][tid]  = gBsc;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                uG[rt] = uG_nxt[rt]; dG[rt] = dG_nxt[rt];
+                uU[rt] = uU_nxt[rt]; dU[rt] = dU_nxt[rt];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int out_row = (rg0 + rt) * 8 + lane_r;
+        if (out_row < M) {
+#pragma unroll
+            for (int nt = 0; nt < N_TILES; ++nt) {
+                const int col0 = col_base + nt * 8 + c0_off;
+                const int col1 = col_base + nt * 8 + c1_off;
+                if (col0 < N) {
+                    const float gv0 = acc_g[rt][nt][0];
+                    C[(int64_t) col0 * s_dst + out_row] = (gv0 / (1.0f + __expf(-gv0))) * acc_u[rt][nt][0];
+                }
+                if (col1 < N) {
+                    const float gv1 = acc_g[rt][nt][1];
+                    C[(int64_t) col1 * s_dst + out_row] = (gv1 / (1.0f + __expf(-gv1))) * acc_u[rt][nt][1];
+                }
+            }
+        }
+    }
+}
+
+// 2D Warp-Tiled Lossless 2-Nibble INT8 GEMM (WARPS_M x WARPS_N warp grid, 128-bit LDG.128/STS.128/LDS.128)
+template <int WARPS_M, int WARPS_N, int R_TILES, int N_TILES_W, bool SINGLE_BUF = false>
+__global__ static void __launch_bounds__(WARPS_M * WARPS_N * 32)
+pq2_narrow2d_i8_kernel(
+        const uint2   * __restrict__ A_qs,
+        const half    * __restrict__ A_d,
+        const uint4   * __restrict__ B_i8_u4,
+        const int32_t * __restrict__ B_sum,
+        const float   * __restrict__ B_sc,
+        const float   * __restrict__ add_src,
+        float         * __restrict__ C,
+        const int M, const int N, const int K, const int64_t s_dst) {
+    constexpr int WARPS  = WARPS_M * WARPS_N;
+    constexpr int N_PAD  = WARPS_N * N_TILES_W * 8;
+    constexpr int N_BUFS = SINGLE_BUF ? 1 : 2;
+    const int tid      = threadIdx.x;
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int warp_m   = warp / WARPS_N;
+    const int warp_n   = warp % WARPS_N;
+    int bx = blockIdx.x, by = blockIdx.y;
+    if (gridDim.y >= 2) {
+        const int gy = gridDim.y;
+        const int sw = (gy >= 4) ? 4 : 2;
+        const int linear = blockIdx.y * gridDim.x + blockIdx.x;
+        const int grp_tiles = gridDim.x * sw;
+        const int grp = linear / grp_tiles;
+        const int rem = linear - grp * grp_tiles;
+        const int y0  = grp * sw;
+        const int sw_cur = min(sw, gy - y0);
+        by = y0 + (rem % sw_cur);
+        bx = rem / sw_cur;
+    }
+    const int rg0      = (bx * WARPS_M + warp_m) * R_TILES;
+    const int col_base = by * N_PAD;
+    const int wn_col0  = warp_n * N_TILES_W * 8;
+
+    const int n_kblk   = K >> 7;
+    const int split_k  = gridDim.z;
+    const int sk_id    = blockIdx.z;
+    const int kb_start = (n_kblk * sk_id) / split_k;
+    const int kb_end   = (n_kblk * (sk_id + 1)) / split_k;
+    if (kb_start >= kb_end) { return; }
+
+    __shared__ uint4   sB[N_BUFS][N_PAD][9];
+    __shared__ int32_t sBsum[N_BUFS][N_PAD];
+    __shared__ float   sBsc[N_BUFS][N_PAD];
+
+    float acc[R_TILES][N_TILES_W][2];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt)
+#pragma unroll
+        for (int nt = 0; nt < N_TILES_W; ++nt) { acc[rt][nt][0] = 0.0f; acc[rt][nt][1] = 0.0f; }
+
+    const int lane_r = lane >> 2;
+    const int lane_k = lane & 3;
+    const int c0_off = lane_k * 2;
+    const int c1_off = c0_off + 1;
+
+    constexpr int TOTAL_U4  = N_PAD * 8;
+    constexpr int U4_PER_TH = (TOTAL_U4 + WARPS * 32 - 1) / (WARPS * 32);
+#pragma unroll
+    for (int bi = 0; bi < U4_PER_TH; ++bi) {
+        const int idx = tid + bi * (WARPS * 32);
+        if (idx < TOTAL_U4) {
+            const int c = idx >> 3;
+            const int w = idx & 7;
+            sB[0][c][w] = B_i8_u4[((int64_t)(col_base + c) * n_kblk + kb_start) * 8 + w];
+        }
+    }
+    if (tid < N_PAD) {
+        sBsum[0][tid] = B_sum[(int64_t)(col_base + tid) * n_kblk + kb_start];
+        sBsc[0][tid]  = B_sc[(int64_t)(col_base + tid) * n_kblk + kb_start];
+    }
+    __syncthreads();
+
+    uint2 uA[R_TILES];
+    float dA[R_TILES];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int rg = rg0 + rt;
+        if (rg * 8 < M) {
+            uA[rt] = A_qs[((int64_t) rg * n_kblk + kb_start) * 32 + lane];
+            dA[rt] = __half2float(A_d[((int64_t) rg * n_kblk + kb_start) * 8 + lane_r]);
+        } else { uA[rt] = make_uint2(0u, 0u); dA[rt] = 0.0f; }
+    }
+
+    for (int kb = kb_start; kb < kb_end; ++kb) {
+        const int cur = SINGLE_BUF ? 0 : ((kb - kb_start) & 1);
+        const int nxt = SINGLE_BUF ? 0 : (cur ^ 1);
+        const bool has_nxt = (kb + 1 < kb_end);
+
+        uint32_t a0[R_TILES], a1[R_TILES], a2[R_TILES], a3[R_TILES];
+#pragma unroll
+        for (int rt = 0; rt < R_TILES; ++rt) {
+            a0[rt] = (uA[rt].x & 0x03030303u) | ((uA[rt].x & 0x0C0C0C0Cu) << 2);
+            a1[rt] = ((uA[rt].x >> 4) & 0x03030303u) | ((uA[rt].x >> 2) & 0x30303030u);
+            a2[rt] = (uA[rt].y & 0x03030303u) | ((uA[rt].y & 0x0C0C0C0Cu) << 2);
+            a3[rt] = ((uA[rt].y >> 4) & 0x03030303u) | ((uA[rt].y >> 2) & 0x30303030u);
+        }
+
+        uint2 uA_nxt[R_TILES];
+        float dA_nxt[R_TILES];
+        uint4 gB[U4_PER_TH];
+        int32_t gBsum = 0;
+        float   gBsc  = 0.0f;
+        if (has_nxt) {
+            const int kb1 = kb + 1;
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                const int rg = rg0 + rt;
+                if (rg * 8 < M) {
+                    uA_nxt[rt] = A_qs[((int64_t) rg * n_kblk + kb1) * 32 + lane];
+                    dA_nxt[rt] = __half2float(A_d[((int64_t) rg * n_kblk + kb1) * 8 + lane_r]);
+                } else { uA_nxt[rt] = make_uint2(0u, 0u); dA_nxt[rt] = 0.0f; }
+            }
+#pragma unroll
+            for (int bi = 0; bi < U4_PER_TH; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_U4) {
+                    const int c = idx >> 3;
+                    const int w = idx & 7;
+                    gB[bi] = B_i8_u4[((int64_t)(col_base + c) * n_kblk + kb1) * 8 + w];
+                }
+            }
+            if (tid < N_PAD) {
+                gBsum = B_sum[(int64_t)(col_base + tid) * n_kblk + kb1];
+                gBsc  = B_sc[(int64_t)(col_base + tid) * n_kblk + kb1];
+            }
+        }
+
+#pragma unroll
+        for (int nt = 0; nt < N_TILES_W; ++nt) {
+            const int b_col = wn_col0 + nt * 8 + lane_r;
+            const uint4 bh = sB[cur][b_col][lane_k];
+            const uint4 bl = sB[cur][b_col][4 + lane_k];
+            const int32_t bs0 = sBsum[cur][wn_col0 + nt * 8 + c0_off];
+            const int32_t bs1 = sBsum[cur][wn_col0 + nt * 8 + c1_off];
+            const float   bsc0 = sBsc[cur][wn_col0 + nt * 8 + c0_off];
+            const float   bsc1 = sBsc[cur][wn_col0 + nt * 8 + c1_off];
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                int32_t dhi[2] = { 0, 0 }, dlo[2] = { 0, 0 };
+                pq2_mma_s4_m8n8k32(dhi, a0[rt], bh.x, dhi);
+                pq2_mma_s4_m8n8k32(dhi, a1[rt], bh.y, dhi);
+                pq2_mma_s4_m8n8k32(dhi, a2[rt], bh.z, dhi);
+                pq2_mma_s4_m8n8k32(dhi, a3[rt], bh.w, dhi);
+                pq2_mma_s4_m8n8k32(dlo, a0[rt], bl.x, dlo);
+                pq2_mma_s4_m8n8k32(dlo, a1[rt], bl.y, dlo);
+                pq2_mma_s4_m8n8k32(dlo, a2[rt], bl.z, dlo);
+                pq2_mma_s4_m8n8k32(dlo, a3[rt], bl.w, dlo);
+                acc[rt][nt][0] = fmaf((float)((dhi[0] << 4) + dlo[0] - bs0), dA[rt] * bsc0, acc[rt][nt][0]);
+                acc[rt][nt][1] = fmaf((float)((dhi[1] << 4) + dlo[1] - bs1), dA[rt] * bsc1, acc[rt][nt][1]);
+            }
+        }
+        if (has_nxt) {
+            if constexpr (SINGLE_BUF) { __syncthreads(); }
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) { uA[rt] = uA_nxt[rt]; dA[rt] = dA_nxt[rt]; }
+#pragma unroll
+            for (int bi = 0; bi < U4_PER_TH; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_U4) { sB[nxt][idx >> 3][idx & 7] = gB[bi]; }
+            }
+            if (tid < N_PAD) { sBsum[nxt][tid] = gBsum; sBsc[nxt][tid] = gBsc; }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int row = (rg0 + rt) * 8 + lane_r;
+        if (row < M) {
+#pragma unroll
+            for (int nt = 0; nt < N_TILES_W; ++nt) {
+                const int c0 = col_base + wn_col0 + nt * 8 + c0_off;
+                const int c1 = col_base + wn_col0 + nt * 8 + c1_off;
+                if (split_k == 1) {
+                    if (c0 < N) {
+                        const int64_t off = (int64_t) c0 * s_dst + row;
+                        C[off] = add_src ? (acc[rt][nt][0] + add_src[off]) : acc[rt][nt][0];
+                    }
+                    if (c1 < N) {
+                        const int64_t off = (int64_t) c1 * s_dst + row;
+                        C[off] = add_src ? (acc[rt][nt][1] + add_src[off]) : acc[rt][nt][1];
+                    }
+                } else {
+                    if (c0 < N) { atomicAdd(&C[(int64_t) c0 * s_dst + row], acc[rt][nt][0]); }
+                    if (c1 < N) { atomicAdd(&C[(int64_t) c1 * s_dst + row], acc[rt][nt][1]); }
+                }
+            }
+        }
+    }
+}
+
+template <int WARPS_M, int WARPS_N, int R_TILES, int N_TILES_W, bool SINGLE_BUF = false>
+__global__ static void __launch_bounds__(WARPS_M * WARPS_N * 32)
+pq2_narrow2d_swiglu_kernel(
+        const uint2   * __restrict__ G_qs, const half * __restrict__ G_d,
+        const uint2   * __restrict__ U_qs, const half * __restrict__ U_d,
+        const uint4   * __restrict__ B_i8_u4, const int32_t * __restrict__ B_sum, const float * __restrict__ B_sc,
+        float * __restrict__ C, const int M, const int N, const int K, const int64_t s_dst) {
+    constexpr int WARPS  = WARPS_M * WARPS_N;
+    constexpr int N_PAD  = WARPS_N * N_TILES_W * 8;
+    constexpr int N_BUFS = SINGLE_BUF ? 1 : 2;
+    const int tid      = threadIdx.x;
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int warp_m   = warp / WARPS_N;
+    const int warp_n   = warp % WARPS_N;
+    int bx = blockIdx.x, by = blockIdx.y;
+    if (gridDim.y >= 2) {
+        const int gy = gridDim.y;
+        const int sw = (gy >= 4) ? 4 : 2;
+        const int linear = blockIdx.y * gridDim.x + blockIdx.x;
+        const int grp_tiles = gridDim.x * sw;
+        const int grp = linear / grp_tiles;
+        const int rem = linear - grp * grp_tiles;
+        const int y0  = grp * sw;
+        const int sw_cur = min(sw, gy - y0);
+        by = y0 + (rem % sw_cur);
+        bx = rem / sw_cur;
+    }
+    const int rg0      = (bx * WARPS_M + warp_m) * R_TILES;
+    const int col_base = by * N_PAD;
+    const int wn_col0  = warp_n * N_TILES_W * 8;
+    const int n_kblk   = K >> 7;
+
+    __shared__ uint4   sB[N_BUFS][N_PAD][9];
+    __shared__ int32_t sBsum[N_BUFS][N_PAD];
+    __shared__ float   sBsc[N_BUFS][N_PAD];
+
+    float acc_g[R_TILES][N_TILES_W][2], acc_u[R_TILES][N_TILES_W][2];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt)
+#pragma unroll
+        for (int nt = 0; nt < N_TILES_W; ++nt) {
+            acc_g[rt][nt][0] = 0.0f; acc_g[rt][nt][1] = 0.0f;
+            acc_u[rt][nt][0] = 0.0f; acc_u[rt][nt][1] = 0.0f;
+        }
+
+    const int lane_r = lane >> 2;
+    const int lane_k = lane & 3;
+    const int c0_off = lane_k * 2;
+    const int c1_off = c0_off + 1;
+    constexpr int TOTAL_U4  = N_PAD * 8;
+    constexpr int U4_PER_TH = (TOTAL_U4 + WARPS * 32 - 1) / (WARPS * 32);
+
+#pragma unroll
+    for (int bi = 0; bi < U4_PER_TH; ++bi) {
+        const int idx = tid + bi * (WARPS * 32);
+        if (idx < TOTAL_U4) { sB[0][idx >> 3][idx & 7] = B_i8_u4[((int64_t)(col_base + (idx >> 3)) * n_kblk) * 8 + (idx & 7)]; }
+    }
+    if (tid < N_PAD) {
+        sBsum[0][tid] = B_sum[(int64_t)(col_base + tid) * n_kblk];
+        sBsc[0][tid]  = B_sc[(int64_t)(col_base + tid) * n_kblk];
+    }
+    __syncthreads();
+
+    uint2 uG[R_TILES], uU[R_TILES];
+    float dG[R_TILES], dU[R_TILES];
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int rg = rg0 + rt;
+        if (rg * 8 < M) {
+            const int64_t qoff = ((int64_t) rg * n_kblk) * 32 + lane;
+            const int64_t doff = ((int64_t) rg * n_kblk) * 8 + lane_r;
+            uG[rt] = G_qs[qoff]; dG[rt] = __half2float(G_d[doff]);
+            uU[rt] = U_qs[qoff]; dU[rt] = __half2float(U_d[doff]);
+        } else { uG[rt] = make_uint2(0u, 0u); dG[rt] = 0.0f; uU[rt] = make_uint2(0u, 0u); dU[rt] = 0.0f; }
+    }
+
+    for (int kb = 0; kb < n_kblk; ++kb) {
+        const int cur = SINGLE_BUF ? 0 : (kb & 1);
+        const int nxt = SINGLE_BUF ? 0 : (cur ^ 1);
+        const bool has_nxt = (kb + 1 < n_kblk);
+
+        uint2 uG_nxt[R_TILES], uU_nxt[R_TILES];
+        float dG_nxt[R_TILES], dU_nxt[R_TILES];
+        uint4 gB[U4_PER_TH];
+        int32_t gBsum = 0; float gBsc = 0.0f;
+        if (has_nxt) {
+            const int kb1 = kb + 1;
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                const int rg = rg0 + rt;
+                if (rg * 8 < M) {
+                    const int64_t qoff = ((int64_t) rg * n_kblk + kb1) * 32 + lane;
+                    const int64_t doff = ((int64_t) rg * n_kblk + kb1) * 8 + lane_r;
+                    uG_nxt[rt] = G_qs[qoff]; dG_nxt[rt] = __half2float(G_d[doff]);
+                    uU_nxt[rt] = U_qs[qoff]; dU_nxt[rt] = __half2float(U_d[doff]);
+                } else { uG_nxt[rt] = make_uint2(0u, 0u); dG_nxt[rt] = 0.0f; uU_nxt[rt] = make_uint2(0u, 0u); dU_nxt[rt] = 0.0f; }
+            }
+#pragma unroll
+            for (int bi = 0; bi < U4_PER_TH; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_U4) { gB[bi] = B_i8_u4[((int64_t)(col_base + (idx >> 3)) * n_kblk + kb1) * 8 + (idx & 7)]; }
+            }
+            if (tid < N_PAD) {
+                gBsum = B_sum[(int64_t)(col_base + tid) * n_kblk + kb1];
+                gBsc  = B_sc[(int64_t)(col_base + tid) * n_kblk + kb1];
+            }
+        }
+
+#pragma unroll
+        for (int nt = 0; nt < N_TILES_W; ++nt) {
+            const int b_col = wn_col0 + nt * 8 + lane_r;
+            const uint4 bh = sB[cur][b_col][lane_k];
+            const uint4 bl = sB[cur][b_col][4 + lane_k];
+            const int32_t bs0 = sBsum[cur][wn_col0 + nt * 8 + c0_off];
+            const int32_t bs1 = sBsum[cur][wn_col0 + nt * 8 + c1_off];
+            const float   bsc0 = sBsc[cur][wn_col0 + nt * 8 + c0_off];
+            const float   bsc1 = sBsc[cur][wn_col0 + nt * 8 + c1_off];
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) {
+                const uint32_t g0 = (uG[rt].x & 0x03030303u) | ((uG[rt].x & 0x0C0C0C0Cu) << 2);
+                const uint32_t g1 = ((uG[rt].x >> 4) & 0x03030303u) | ((uG[rt].x >> 2) & 0x30303030u);
+                const uint32_t g2 = (uG[rt].y & 0x03030303u) | ((uG[rt].y & 0x0C0C0C0Cu) << 2);
+                const uint32_t g3 = ((uG[rt].y >> 4) & 0x03030303u) | ((uG[rt].y >> 2) & 0x30303030u);
+                int32_t dgh[2] = { 0, 0 }, dgl[2] = { 0, 0 };
+                pq2_mma_s4_m8n8k32(dgh, g0, bh.x, dgh);
+                pq2_mma_s4_m8n8k32(dgh, g1, bh.y, dgh);
+                pq2_mma_s4_m8n8k32(dgh, g2, bh.z, dgh);
+                pq2_mma_s4_m8n8k32(dgh, g3, bh.w, dgh);
+                pq2_mma_s4_m8n8k32(dgl, g0, bl.x, dgl);
+                pq2_mma_s4_m8n8k32(dgl, g1, bl.y, dgl);
+                pq2_mma_s4_m8n8k32(dgl, g2, bl.z, dgl);
+                pq2_mma_s4_m8n8k32(dgl, g3, bl.w, dgl);
+                acc_g[rt][nt][0] = fmaf((float)((dgh[0] << 4) + dgl[0] - bs0), dG[rt] * bsc0, acc_g[rt][nt][0]);
+                acc_g[rt][nt][1] = fmaf((float)((dgh[1] << 4) + dgl[1] - bs1), dG[rt] * bsc1, acc_g[rt][nt][1]);
+
+                const uint32_t p0 = (uU[rt].x & 0x03030303u) | ((uU[rt].x & 0x0C0C0C0Cu) << 2);
+                const uint32_t p1 = ((uU[rt].x >> 4) & 0x03030303u) | ((uU[rt].x >> 2) & 0x30303030u);
+                const uint32_t p2 = (uU[rt].y & 0x03030303u) | ((uU[rt].y & 0x0C0C0C0Cu) << 2);
+                const uint32_t p3 = ((uU[rt].y >> 4) & 0x03030303u) | ((uU[rt].y >> 2) & 0x30303030u);
+                int32_t duh[2] = { 0, 0 }, dul[2] = { 0, 0 };
+                pq2_mma_s4_m8n8k32(duh, p0, bh.x, duh);
+                pq2_mma_s4_m8n8k32(duh, p1, bh.y, duh);
+                pq2_mma_s4_m8n8k32(duh, p2, bh.z, duh);
+                pq2_mma_s4_m8n8k32(duh, p3, bh.w, duh);
+                pq2_mma_s4_m8n8k32(dul, p0, bl.x, dul);
+                pq2_mma_s4_m8n8k32(dul, p1, bl.y, dul);
+                pq2_mma_s4_m8n8k32(dul, p2, bl.z, dul);
+                pq2_mma_s4_m8n8k32(dul, p3, bl.w, dul);
+                acc_u[rt][nt][0] = fmaf((float)((duh[0] << 4) + dul[0] - bs0), dU[rt] * bsc0, acc_u[rt][nt][0]);
+                acc_u[rt][nt][1] = fmaf((float)((duh[1] << 4) + dul[1] - bs1), dU[rt] * bsc1, acc_u[rt][nt][1]);
+            }
+        }
+        if (has_nxt) {
+            if constexpr (SINGLE_BUF) { __syncthreads(); }
+#pragma unroll
+            for (int rt = 0; rt < R_TILES; ++rt) { uG[rt] = uG_nxt[rt]; dG[rt] = dG_nxt[rt]; uU[rt] = uU_nxt[rt]; dU[rt] = dU_nxt[rt]; }
+#pragma unroll
+            for (int bi = 0; bi < U4_PER_TH; ++bi) {
+                const int idx = tid + bi * (WARPS * 32);
+                if (idx < TOTAL_U4) { sB[nxt][idx >> 3][idx & 7] = gB[bi]; }
+            }
+            if (tid < N_PAD) { sBsum[nxt][tid] = gBsum; sBsc[nxt][tid] = gBsc; }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int rt = 0; rt < R_TILES; ++rt) {
+        const int row = (rg0 + rt) * 8 + lane_r;
+        if (row < M) {
+#pragma unroll
+            for (int nt = 0; nt < N_TILES_W; ++nt) {
+                const int c0 = col_base + wn_col0 + nt * 8 + c0_off;
+                const int c1 = col_base + wn_col0 + nt * 8 + c1_off;
+                if (c0 < N) { const float gv0 = acc_g[rt][nt][0]; C[(int64_t) c0 * s_dst + row] = (gv0 / (1.0f + __expf(-gv0))) * acc_u[rt][nt][0]; }
+                if (c1 < N) { const float gv1 = acc_g[rt][nt][1]; C[(int64_t) c1 * s_dst + row] = (gv1 / (1.0f + __expf(-gv1))) * acc_u[rt][nt][1]; }
+            }
+        }
+    }
+}
+
+static void pq2_narrow_i8_cache_invalidate(cudaStream_t stream);
+static void pq2_narrow_i8_cache_invalidate_if_overlap(cudaStream_t stream, const void * dst_data, size_t dst_nbytes);
+static void pq2_prefill_i4_cache_invalidate(cudaStream_t stream);
+static void pq2_prefill_i4_cache_invalidate_if_overlap(cudaStream_t stream, const void * dst_data, size_t dst_nbytes);
+
+__device__ __forceinline__ void pq2_ldmatrix_x4(uint32_t * regs, const void * smem_ptr) {
+#if defined(TURING_MMA_AVAILABLE) || defined(AMPERE_MMA_AVAILABLE)
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
+        : "r"(addr));
+#else
+    GGML_UNUSED_VARS(regs, smem_ptr);
+#endif
+}
+
+// Repack PQ2_0 weights into row-major signed-INT4 [-7,+7] [M, K/2] + per-row F32 scale [M]
+__global__ static void repack_pq2_to_s4_rm_kernel(
+        const block_pq2_0 * __restrict__ src, uint32_t * __restrict__ dst_qs, float * __restrict__ dst_d,
+        const int M, const int K) {
+    const int row = blockIdx.x;
+    if (row >= M) { return; }
+    const int tid    = threadIdx.x; // 0..255
+    const int n_kblk = K >> 7;
+    const int K8     = K >> 3;
+    const block_pq2_0 * blks = src + (int64_t) row * n_kblk;
+
+    float d_max = 0.0f;
+    for (int b = tid; b < n_kblk; b += 256) {
+        d_max = fmaxf(d_max, fabsf(__half2float(blks[b].d)));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        d_max = fmaxf(d_max, __shfl_xor_sync(0xFFFFFFFF, d_max, off));
+    }
+    __shared__ float smax[8];
+    if ((tid & 31) == 0) { smax[tid >> 5] = d_max; }
+    __syncthreads();
+    if (tid == 0) {
+        float m = smax[0];
+#pragma unroll
+        for (int i = 1; i < 8; ++i) { m = fmaxf(m, smax[i]); }
+        smax[0] = m;
+        dst_d[row] = m * (1.0f / 7.0f);
+    }
+    __syncthreads();
+    const float inv_d = smax[0] > 0.0f ? (7.0f / smax[0]) : 0.0f;
+
+    uint32_t * out = dst_qs + (int64_t) row * K8;
+    for (int i = tid; i < K8; i += 256) {
+        const int b  = i >> 4;
+        const int kw = i & 15;
+        const float bd = __half2float(blks[b].d) * inv_d;
+        const uint16_t s = (uint16_t) blks[b].qs[kw * 2] | ((uint16_t) blks[b].qs[kw * 2 + 1] << 8);
+        uint32_t w = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int code = (int)((s >> (j * 2)) & 3u) - 1;
+            const int q    = max(-7, min(7, __float2int_rn((float) code * bd)));
+            w |= ((uint32_t)(q & 0xF)) << (j * 4);
+        }
+        out[i] = w;
+    }
+}
+
+struct pq2_s4_rm_entry {
+    uint8_t * qs = nullptr;
+    float   * d  = nullptr;
+    int64_t   M  = 0;
+    int64_t   K  = 0;
+};
+
+static pq2_s4_rm_entry get_or_repack_pq2_s4_rm(
+        const block_pq2_0 * src0, const int64_t M, const int64_t K, cudaStream_t stream, bool allow_alloc) {
+    static std::mutex mu;
+    static std::unordered_map<const void *, pq2_s4_rm_entry> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(src0);
+    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+        return it->second;
+    }
+    if (!allow_alloc) { return {}; }
+    pq2_s4_rm_entry e;
+    e.M = M; e.K = K;
+    if (cudaMalloc(&e.qs, (size_t) M * (size_t) (K >> 1)) != cudaSuccess) {
+        return {};
+    }
+    if (cudaMalloc(&e.d, (size_t) M * sizeof(float)) != cudaSuccess) {
+        cudaFree(e.qs);
+        return {};
+    }
+    repack_pq2_to_s4_rm_kernel<<<(unsigned) M, 256, 0, stream>>>(src0, (uint32_t *) e.qs, e.d, (int) M, (int) K);
+    CUDA_CHECK(cudaGetLastError());
+    cache[src0] = e;
+    return e;
+}
+
+// 1-pass F32 -> per-column RMS-clipped INT4 [-8, +7] + col_scales (eliminates 4.0-sigma outlier blowup!)
+__global__ static void quantize_f32_to_s4_colwise_clipped_kernel(
+        const float * __restrict__ src1, uint32_t * __restrict__ dst_i4,
+        float * __restrict__ dst_scales,
+        const int N, const int N_pad, const int K, const int64_t s11, const float clip_sigma) {
+    const int col = blockIdx.x;
+    if (col >= N_pad) { return; }
+    const int tid = threadIdx.x; // 0..511
+    const int K8  = K >> 3;
+    uint32_t * out32 = dst_i4 + (int64_t) col * K8;
+    if (col >= N) {
+        for (int i = tid; i < K8; i += 512) { out32[i] = 0u; }
+        if (tid == 0) { dst_scales[col] = 0.0f; }
+        return;
+    }
+    const float4 * in4 = (const float4 *) (src1 + (int64_t) col * s11);
+    float bmax = 0.0f, sq = 0.0f;
+    for (int i = tid; i < (K >> 2); i += 512) {
+        const float4 v = in4[i];
+        bmax = fmaxf(bmax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        sq  += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        bmax = fmaxf(bmax, __shfl_xor_sync(0xFFFFFFFF, bmax, off));
+        sq  += __shfl_xor_sync(0xFFFFFFFF, sq,   off);
+    }
+    __shared__ float smax[16], ssq[16];
+    if ((tid & 31) == 0) { smax[tid >> 5] = bmax; ssq[tid >> 5] = sq; }
+    __syncthreads();
+    if (tid == 0) {
+        float m = smax[0], s = ssq[0];
+#pragma unroll
+        for (int i = 1; i < 16; ++i) { m = fmaxf(m, smax[i]); s += ssq[i]; }
+        const float rms = sqrtf(s / (float) K);
+        const float c   = (clip_sigma > 0.0f) ? fminf(m, clip_sigma * rms) : m;
+        smax[0] = c > 0.0f ? (7.0f / c) : 0.0f;
+        dst_scales[col] = c * (1.0f / 7.0f);
+    }
+    __syncthreads();
+    const float inv_scale = smax[0];
+    for (int i = tid; i < K8; i += 512) {
+        const float4 a = in4[2 * i + 0];
+        const float4 b = in4[2 * i + 1];
+        uint32_t w = 0u;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(a.x * inv_scale))) & 0xF)) << 0;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(a.y * inv_scale))) & 0xF)) << 4;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(a.z * inv_scale))) & 0xF)) << 8;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(a.w * inv_scale))) & 0xF)) << 12;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(b.x * inv_scale))) & 0xF)) << 16;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(b.y * inv_scale))) & 0xF)) << 20;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(b.z * inv_scale))) & 0xF)) << 24;
+        w |= ((uint32_t)(max(-8, min(7, __float2int_rn(b.w * inv_scale))) & 0xF)) << 28;
+        out32[i] = w;
+    }
+}
+
+// 217.5 TOPS zero-spill Turing sm_75 INT4 GEMM (128x128x256, 64KB dynamic smem, dblbuf frags, L2 swizzle, coalesced SMEM epilogue!)
+// EPI_MODE: 0 = F32 (+ optional add_src), 1 = write FP16 gate (dst_f16), 2 = read FP16 gate (gate_f16) -> silu(g)*up -> F32 dst
+template <int EPI_MODE = 0>
+__global__ static void __launch_bounds__(256, 1)
+pq2_prefill_s4_128x128x256_ldm_kernel(
+        const uint8_t * __restrict__ A,
+        const float   * __restrict__ row_scales,
+        const uint8_t * __restrict__ B,
+        const float   * __restrict__ col_scales,
+        const void    * __restrict__ aux_src,
+        void          * __restrict__ dst_out,
+        const int M, const int N, const int N_pad, const int K, const int64_t s_dst) {
+    constexpr int BM = 128, BN = 128, BK = 256, BK_B = 128;
+    extern __shared__ __align__(128) uint8_t smem[];
+    uint8_t * smA0 = smem;
+    uint8_t * smA1 = smem + BM * BK_B;
+    uint8_t * smB0 = smem + 2 * BM * BK_B;
+    uint8_t * smB1 = smem + 2 * BM * BK_B + BN * BK_B;
+
+    const int grid_m = M / BM;
+    const int grid_n = N_pad / BN;
+    int bm, bn;
+    if (((grid_m & 3) == 0) && ((grid_n & 3) == 0)) {
+        const int lin = blockIdx.x + blockIdx.y * grid_m;
+        const int super_idx = lin >> 4;
+        const int local = lin & 15;
+        const int n_sm = grid_m >> 2;
+        bm = ((super_idx % n_sm) * 4 + (local & 3)) * BM;
+        bn = ((super_idx / n_sm) * 4 + (local >> 2)) * BN;
+    } else {
+        const int group_m = 8;
+        const int lin = blockIdx.x + blockIdx.y * grid_m;
+        const int blocks_per_group = group_m * grid_n;
+        const int gid = lin / blocks_per_group;
+        const int first_m = gid * group_m;
+        const int gm_size = min(group_m, grid_m - first_m);
+        const int rem = lin % blocks_per_group;
+        bm = (first_m + rem % gm_size) * BM;
+        bn = (rem / gm_size) * BN;
+    }
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int wm   = (warp >> 1) * 32;
+    const int wn   = (warp & 1)  * 64;
+
+    const int K_B      = K >> 1;
+    const int n_ktiles = K / BK;
+
+    const int ld_c  = tid & 7;
+    const int ld_r  = tid >> 3; // 0..31
+    const int sw_c0 = ld_c ^ ((ld_r +  0) & 7);
+    const int sw_c1 = ld_c ^ ((ld_r + 32) & 7);
+    const int sw_c2 = ld_c ^ ((ld_r + 64) & 7);
+    const int sw_c3 = ld_c ^ ((ld_r + 96) & 7);
+
+    int32_t acc[4][8][2] = {};
+    const int ldm_row_a  = wm + lane;
+    const int ldm_row_b0 = wn + lane;
+    const int ldm_row_b1 = wn + 32 + lane;
+
+    {
+        const int k_off = ld_c * 16;
+        *(int4 *) (smA0 + (ld_r +  0) * BK_B + sw_c0 * 16) = *(const int4 *) (A + (int64_t) (bm + ld_r +  0) * K_B + k_off);
+        *(int4 *) (smA0 + (ld_r + 32) * BK_B + sw_c1 * 16) = *(const int4 *) (A + (int64_t) (bm + ld_r + 32) * K_B + k_off);
+        *(int4 *) (smA0 + (ld_r + 64) * BK_B + sw_c2 * 16) = *(const int4 *) (A + (int64_t) (bm + ld_r + 64) * K_B + k_off);
+        *(int4 *) (smA0 + (ld_r + 96) * BK_B + sw_c3 * 16) = *(const int4 *) (A + (int64_t) (bm + ld_r + 96) * K_B + k_off);
+        *(int4 *) (smB0 + (ld_r +  0) * BK_B + sw_c0 * 16) = *(const int4 *) (B + (int64_t) (bn + ld_r +  0) * K_B + k_off);
+        *(int4 *) (smB0 + (ld_r + 32) * BK_B + sw_c1 * 16) = *(const int4 *) (B + (int64_t) (bn + ld_r + 32) * K_B + k_off);
+        *(int4 *) (smB0 + (ld_r + 64) * BK_B + sw_c2 * 16) = *(const int4 *) (B + (int64_t) (bn + ld_r + 64) * K_B + k_off);
+        *(int4 *) (smB0 + (ld_r + 96) * BK_B + sw_c3 * 16) = *(const int4 *) (B + (int64_t) (bn + ld_r + 96) * K_B + k_off);
+    }
+    __syncthreads();
+
+    uint32_t a_frag[2][4];
+    uint32_t b_frag[2][8];
+
+    for (int kt = 0; kt < n_ktiles; ++kt) {
+        uint8_t * sAc = (kt & 1) ? smA1 : smA0;
+        uint8_t * sBc = (kt & 1) ? smB1 : smB0;
+        uint8_t * sAn = (kt & 1) ? smA0 : smA1;
+        uint8_t * sBn = (kt & 1) ? smB0 : smB1;
+
+        pq2_ldmatrix_x4(a_frag[0],     sAc + ldm_row_a  * BK_B + (0 ^ (ldm_row_a  & 7)) * 16);
+        pq2_ldmatrix_x4(b_frag[0] + 0, sBc + ldm_row_b0 * BK_B + (0 ^ (ldm_row_b0 & 7)) * 16);
+        pq2_ldmatrix_x4(b_frag[0] + 4, sBc + ldm_row_b1 * BK_B + (0 ^ (ldm_row_b1 & 7)) * 16);
+
+        const bool has_nxt = (kt + 1 < n_ktiles);
+        const int k_off = (kt + 1) * BK_B + ld_c * 16;
+        int4 gA0, gA1, gA2, gA3, gB0, gB1, gB2, gB3;
+        if (has_nxt) {
+            gA0 = *(const int4 *) (A + (int64_t) (bm + ld_r +  0) * K_B + k_off);
+            gA1 = *(const int4 *) (A + (int64_t) (bm + ld_r + 32) * K_B + k_off);
+            gA2 = *(const int4 *) (A + (int64_t) (bm + ld_r + 64) * K_B + k_off);
+            gA3 = *(const int4 *) (A + (int64_t) (bm + ld_r + 96) * K_B + k_off);
+        }
+
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            const int fc = ks & 1;
+            const int fn = fc ^ 1;
+            if (ks == 4 && has_nxt) {
+                *(int4 *) (sAn + (ld_r +  0) * BK_B + sw_c0 * 16) = gA0;
+                *(int4 *) (sAn + (ld_r + 32) * BK_B + sw_c1 * 16) = gA1;
+                *(int4 *) (sAn + (ld_r + 64) * BK_B + sw_c2 * 16) = gA2;
+                *(int4 *) (sAn + (ld_r + 96) * BK_B + sw_c3 * 16) = gA3;
+                gB0 = *(const int4 *) (B + (int64_t) (bn + ld_r +  0) * K_B + k_off);
+                gB1 = *(const int4 *) (B + (int64_t) (bn + ld_r + 32) * K_B + k_off);
+                gB2 = *(const int4 *) (B + (int64_t) (bn + ld_r + 64) * K_B + k_off);
+                gB3 = *(const int4 *) (B + (int64_t) (bn + ld_r + 96) * K_B + k_off);
+            }
+            if (ks + 1 < 8) {
+                pq2_ldmatrix_x4(a_frag[fn],     sAc + ldm_row_a  * BK_B + ((ks + 1) ^ (ldm_row_a  & 7)) * 16);
+                pq2_ldmatrix_x4(b_frag[fn] + 0, sBc + ldm_row_b0 * BK_B + ((ks + 1) ^ (ldm_row_b0 & 7)) * 16);
+                pq2_ldmatrix_x4(b_frag[fn] + 4, sBc + ldm_row_b1 * BK_B + ((ks + 1) ^ (ldm_row_b1 & 7)) * 16);
+            }
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+#pragma unroll
+                for (int ni = 0; ni < 8; ++ni) {
+                    pq2_mma_s4_m8n8k32(acc[mi][ni], a_frag[fc][mi], b_frag[fc][ni], acc[mi][ni]);
+                }
+            }
+        }
+
+        if (has_nxt) {
+            *(int4 *) (sBn + (ld_r +  0) * BK_B + sw_c0 * 16) = gB0;
+            *(int4 *) (sBn + (ld_r + 32) * BK_B + sw_c1 * 16) = gB1;
+            *(int4 *) (sBn + (ld_r + 64) * BK_B + sw_c2 * 16) = gB2;
+            *(int4 *) (sBn + (ld_r + 96) * BK_B + sw_c3 * 16) = gB3;
+            __syncthreads();
+        }
+    }
+
+    __syncthreads();
+    int32_t * smC = (int32_t *) smA0;
+    int32_t * wC  = smC + warp * (8 * 36);
+    const int c_row     = lane >> 2;
+    const int c_col     = (lane & 3) * 2;
+    const int col_local = lane >> 3;
+    const int row4_off  = (lane & 7) * 4;
+    const float4 rs4    = *(const float4 *) (row_scales + bm + wm + row4_off);
+#pragma unroll
+    for (int ni = 0; ni < 8; ++ni) {
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi) {
+            wC[(c_col + 0) * 36 + mi * 8 + c_row] = acc[mi][ni][0];
+            wC[(c_col + 1) * 36 + mi * 8 + c_row] = acc[mi][ni][1];
+        }
+        __syncwarp();
+#pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int col = bn + wn + ni * 8 + pass * 4 + col_local;
+            if (col < N) {
+                const float cs = __ldg(col_scales + col);
+                const int4  q4 = *(const int4 *) (wC + (pass * 4 + col_local) * 36 + row4_off);
+                float4 v4;
+                v4.x = (float) q4.x * (rs4.x * cs);
+                v4.y = (float) q4.y * (rs4.y * cs);
+                v4.z = (float) q4.z * (rs4.z * cs);
+                v4.w = (float) q4.w * (rs4.w * cs);
+                const int64_t idx = (int64_t) col * s_dst + bm + wm + row4_off;
+                if constexpr (EPI_MODE == 1) {
+                    const half2 h0 = __floats2half2_rn(v4.x, v4.y);
+                    const half2 h1 = __floats2half2_rn(v4.z, v4.w);
+                    uint2 u;
+                    u.x = *(const uint32_t *) &h0;
+                    u.y = *(const uint32_t *) &h1;
+                    *(uint2 *) (((half *) dst_out) + idx) = u;
+                } else if constexpr (EPI_MODE == 2 || EPI_MODE == 3) {
+                    const uint2 u = *(const uint2 *) (((const half *) aux_src) + idx);
+                    const half2 h0 = *(const half2 *) &u.x;
+                    const half2 h1 = *(const half2 *) &u.y;
+                    const float2 g01 = __half22float2(h0);
+                    const float2 g23 = __half22float2(h1);
+                    v4.x *= __fdividef(g01.x, 1.0f + __expf(-g01.x));
+                    v4.y *= __fdividef(g01.y, 1.0f + __expf(-g01.y));
+                    v4.z *= __fdividef(g23.x, 1.0f + __expf(-g23.x));
+                    v4.w *= __fdividef(g23.y, 1.0f + __expf(-g23.y));
+                    if constexpr (EPI_MODE == 3) {
+                        const half2 o0 = __floats2half2_rn(v4.x, v4.y);
+                        const half2 o1 = __floats2half2_rn(v4.z, v4.w);
+                        uint2 ou;
+                        ou.x = *(const uint32_t *) &o0;
+                        ou.y = *(const uint32_t *) &o1;
+                        *(uint2 *) (((half *) dst_out) + idx) = ou;
+                    } else {
+                        *(float4 *) (((float *) dst_out) + idx) = v4;
+                    }
+                } else {
+                    if (aux_src) {
+                        const float4 a4 = *(const float4 *) (((const float *) aux_src) + idx);
+                        v4.x += a4.x; v4.y += a4.y; v4.z += a4.z; v4.w += a4.w;
+                    }
+                    *(float4 *) (((float *) dst_out) + idx) = v4;
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+template <int EPI_MODE>
+static void launch_pq2_prefill_s4_128x128x256(
+        dim3 grid, cudaStream_t stream,
+        const uint8_t * A, const float * rsc, const uint8_t * B, const float * csc,
+        const void * aux_src, void * dst_out, int M, int N, int N_pad, int K, int64_t s_dst) {
+    static bool attr_set = false;
+    if (!attr_set) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            pq2_prefill_s4_128x128x256_ldm_kernel<EPI_MODE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+        attr_set = true;
+    }
+    pq2_prefill_s4_128x128x256_ldm_kernel<EPI_MODE><<<grid, 256, 65536, stream>>>(
+        A, rsc, B, csc, aux_src, dst_out, M, N, N_pad, K, s_dst);
+}
+
+struct pq2_prefill_i4_scratch {
+    uint32_t   * B_i4        = nullptr;
+    float      * B_scales    = nullptr;
+    half       * gate_f16    = nullptr;
+    half       * mul_w_f16   = nullptr;
+    size_t       cap_b       = 0;
+    size_t       cap_sc      = 0;
+    size_t       cap_gate    = 0;
+    size_t       cap_mw_f16  = 0;
+    const void * src1_data   = nullptr;
+    size_t       src1_nbytes = 0;
+    int64_t      N           = 0;
+    int64_t      K           = 0;
+    int64_t      s11         = 0;
+    uint64_t     gen         = 0;
+    bool         valid       = false;
+    const void * mw_data     = nullptr;
+    size_t       mw_nbytes   = 0;
+    int64_t      mw_N        = 0;
+    int64_t      mw_K        = 0;
+    bool         mw_valid    = false;
+};
+
+static pq2_prefill_i4_scratch & pq2_prefill_i4_scratch_for_stream(cudaStream_t stream) {
+    static std::mutex mu;
+    static std::unordered_map<cudaStream_t, pq2_prefill_i4_scratch> map;
+    std::lock_guard<std::mutex> lock(mu);
+    return map[stream];
+}
+
+static bool ggml_cuda_mul_mat_pq2_prefill_int4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * add_src = nullptr) {
+    if (!ggml_cuda_pq2_prefill_int4_enabled()) { return false; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) { return false; }
+    if (src0->type != GGML_TYPE_PQ2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    if (add_src && (add_src->type != GGML_TYPE_F32 || !ggml_are_same_shape(add_src, dst) ||
+            add_src->nb[0] != sizeof(float) || add_src->nb[1] != dst->nb[1])) { return false; }
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    if (N < 256 || M > 65536 || (K % 256) != 0 || (M % 128) != 0 ||
+            !ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap_status);
+    const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
+
+    const auto ae = get_or_repack_pq2_s4_rm((const block_pq2_0 *) src0->data, M, K, stream, allow_alloc);
+    if (!ae.qs || !ae.d) { return false; }
+
+    const int64_t N_pad = ((N + 127) / 128) * 128;
+    const int64_t s11   = src1->nb[1] / sizeof(float);
+    const int64_t s_dst = dst->nb[1] / sizeof(float);
+    auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+    const size_t need_b  = (size_t) N_pad * (size_t) (K >> 3) * sizeof(uint32_t);
+    const size_t need_sc = (size_t) N_pad * sizeof(float);
+    if (sc.cap_b < need_b || sc.cap_sc < need_sc) {
+        if (!allow_alloc) { return false; }
+        if (sc.B_i4)     { CUDA_CHECK(cudaFree(sc.B_i4)); }
+        if (sc.B_scales) { CUDA_CHECK(cudaFree(sc.B_scales)); }
+        CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));
+        CUDA_CHECK(cudaMalloc(&sc.B_scales, need_sc));
+        sc.cap_b = need_b; sc.cap_sc = need_sc;
+        sc.valid = false;
+    }
+    if (!(sc.valid && sc.src1_data == src1->data && sc.N == N && sc.K == K && sc.s11 == s11)) {
+        quantize_f32_to_s4_colwise_clipped_kernel<<<(unsigned) N_pad, 512, 0, stream>>>(
+            (const float *) src1->data, sc.B_i4, sc.B_scales,
+            (int) N, (int) N_pad, (int) K, s11, ggml_cuda_pq2_prefill_int4_clip());
+        sc.src1_data   = src1->data;
+        sc.src1_nbytes = ggml_nbytes(src1);
+        sc.N = N; sc.K = K; sc.s11 = s11; sc.valid = true;
+    }
+    dim3 grid((unsigned) (M / 128), (unsigned) (N_pad / 128));
+    launch_pq2_prefill_s4_128x128x256<0>(
+        grid, stream, ae.qs, ae.d, (const uint8_t *) sc.B_i4, sc.B_scales,
+        add_src ? (const void *) add_src->data : nullptr,
+        (void *) dst->data, (int) M, (int) N, (int) N_pad, (int) K, s_dst);
+    pq2_prefill_i4_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// 1-pass ZERO-SMEM half2 (128B/warp LDG.32 + 32B sector STG.32) warp-parallel MUL(signs) + FWHT(1024) -> RMS-clipped INT4 B_s4!
+__global__ static void __launch_bounds__(576, 1)
+mul_signs_fwht1024_to_s4_f16_kernel(
+        const half * __restrict__ src_f16, const float * __restrict__ signs,
+        uint32_t * __restrict__ dst_s4, float * __restrict__ out_col_scales,
+        const int M, const int N, const int N_pad, const int64_t s11, const float clip_sigma) {
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid   = threadIdx.x;
+    const int warp  = tid >> 5;
+    const int lane  = tid & 31;
+    const int n_blk = M >> 10;
+    uint32_t * out32 = dst_s4 + (int64_t) j * (M >> 3);
+    if (j >= N) {
+        if (tid == 0) { out_col_scales[j] = 0.0f; }
+        for (int i = tid; i < (M >> 3); i += blockDim.x) { out32[i] = 0u; }
+        return;
+    }
+    const half2  * in_col2 = (const half2  *) (src_f16 + (int64_t) j * s11);
+    const float2 * signs2  = (const float2 *) signs;
+    float v0[16], v1[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const int idx2 = warp * 512 + k * 32 + lane;
+        const float2 xf = __half22float2(in_col2[idx2]);
+        const float2 sf = __ldg(signs2 + idx2);
+        const float x0 = xf.x * sf.x;
+        const float x1 = xf.y * sf.y;
+        // Stage 0 (bit 0, stride 1) in-register!
+        v0[k] = x0 + x1;
+        v1[k] = x0 - x1;
+    }
+    // Stages 6..9 (bits 6..9, across k = 0..15) in-register!
+#pragma unroll
+    for (int h = 1; h < 16; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 16; k += (h << 1)) {
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a0 = v0[k + r], b0 = v0[k + r + h];
+                v0[k + r] = a0 + b0; v0[k + r + h] = a0 - b0;
+                const float a1 = v1[k + r], b1 = v1[k + r + h];
+                v1[k + r] = a1 + b1; v1[k + r + h] = a1 - b1;
+            }
+        }
+    }
+    // Stages 1..5 (bits 1..5, across lane = 0..31) via warp shuffle!
+    float cmax = 0.0f, csq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        float x0 = v0[k], x1 = v1[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float y0 = __shfl_xor_sync(0xFFFFFFFF, x0, h);
+            const float y1 = __shfl_xor_sync(0xFFFFFFFF, x1, h);
+            x0 = ((lane & h) == 0) ? (x0 + y0) : (y0 - x0);
+            x1 = ((lane & h) == 0) ? (x1 + y1) : (y1 - x1);
+        }
+        v0[k] = x0; v1[k] = x1;
+        cmax = fmaxf(cmax, fmaxf(fabsf(x0), fabsf(x1)));
+        csq += x0 * x0 + x1 * x1;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+        csq += __shfl_xor_sync(0xFFFFFFFF, csq,  off);
+    }
+    __shared__ float smax[24], ssq[24];
+    if (lane == 0) { smax[warp] = cmax; ssq[warp] = csq; }
+    __syncthreads();
+    float max_v = 0.0f, tot_sq = 0.0f;
+    for (int w = 0; w < n_blk; ++w) {
+        max_v  = fmaxf(max_v, smax[w]);
+        tot_sq += ssq[w];
+    }
+    const float rms = sqrtf(tot_sq / (float) M);
+    const float c   = (clip_sigma > 0.0f) ? fminf(max_v, clip_sigma * rms) : max_v;
+    const float inv_scale = c > 0.0f ? (7.0f / c) : 0.0f;
+    if (tid == 0) { out_col_scales[j] = (c * (1.0f / 7.0f)) * (1.0f / 32.0f); }
+    uint32_t * out_blk = out32 + warp * 128;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        uint32_t q = ((uint32_t)(max(-8, min(7, __float2int_rn(v0[k] * inv_scale))) & 0xF))
+                   | (((uint32_t)(max(-8, min(7, __float2int_rn(v1[k] * inv_scale))) & 0xF)) << 4);
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 8;
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 16;
+        if ((lane & 3) == 0) { out_blk[k * 8 + (lane >> 2)] = q; }
+    }
+}
+
+static bool ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+        const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * fwht_signs = nullptr, const ggml_tensor * fwht_out = nullptr, int fwht_H = 0) {
+    if (!ggml_cuda_pq2_prefill_int4_enabled()) { return false; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) { return false; }
+    if (gate_w->type != GGML_TYPE_PQ2_0 || up_w->type != GGML_TYPE_PQ2_0 ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (!ggml_are_same_shape(gate_w, up_w) || gate_w->ne[2] != 1 || gate_w->ne[3] != 1 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    const int64_t K = gate_w->ne[0], M = gate_w->ne[1], N = src1->ne[1];
+    if (N < 256 || M > 65536 || (K % 256) != 0 || (M % 128) != 0 ||
+            !ggml_is_contiguous(gate_w) || !ggml_is_contiguous(up_w) ||
+            src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            ggml_backend_buffer_get_usage(gate_w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    const bool fuse_fwht_s4 = (fwht_signs != nullptr && fwht_out != nullptr && fwht_H == 1024 &&
+                               (M % 1024) == 0 && (M >> 10) <= 24);
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap_status);
+    const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
+
+    const auto ge = get_or_repack_pq2_s4_rm((const block_pq2_0 *) gate_w->data, M, K, stream, allow_alloc);
+    const auto ue = get_or_repack_pq2_s4_rm((const block_pq2_0 *) up_w->data,   M, K, stream, allow_alloc);
+    if (!ge.qs || !ge.d || !ue.qs || !ue.d) { return false; }
+
+    const int64_t N_pad = ((N + 127) / 128) * 128;
+    const int64_t s11   = src1->nb[1] / sizeof(float);
+    const int64_t s_dst = dst->nb[1] / sizeof(float);
+    auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+    const size_t need_b  = (size_t) N_pad * (size_t) (K >> 3) * sizeof(uint32_t);
+    const size_t need_sc = (size_t) N_pad * sizeof(float);
+    if (sc.cap_b < need_b || sc.cap_sc < need_sc) {
+        if (!allow_alloc) { return false; }
+        if (sc.B_i4)     { CUDA_CHECK(cudaFree(sc.B_i4)); }
+        if (sc.B_scales) { CUDA_CHECK(cudaFree(sc.B_scales)); }
+        CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));
+        CUDA_CHECK(cudaMalloc(&sc.B_scales, need_sc));
+        sc.cap_b = need_b; sc.cap_sc = need_sc;
+        sc.valid = false;
+    }
+    if (!(sc.valid && sc.src1_data == src1->data && sc.N == N && sc.K == K && sc.s11 == s11)) {
+        quantize_f32_to_s4_colwise_clipped_kernel<<<(unsigned) N_pad, 512, 0, stream>>>(
+            (const float *) src1->data, sc.B_i4, sc.B_scales,
+            (int) N, (int) N_pad, (int) K, s11, ggml_cuda_pq2_prefill_int4_clip());
+        sc.src1_data   = src1->data;
+        sc.src1_nbytes = ggml_nbytes(src1);
+        sc.N = N; sc.K = K; sc.s11 = s11; sc.valid = true;
+    }
+    const size_t need_gate = (size_t) N * (size_t) s_dst * sizeof(half);
+    if (sc.cap_gate < need_gate) {
+        if (!allow_alloc) { return false; }
+        if (sc.gate_f16) { CUDA_CHECK(cudaFree(sc.gate_f16)); }
+        CUDA_CHECK(cudaMalloc(&sc.gate_f16, need_gate));
+        sc.cap_gate = need_gate;
+    }
+    dim3 grid((unsigned) (M / 128), (unsigned) (N_pad / 128));
+    launch_pq2_prefill_s4_128x128x256<1>(
+        grid, stream, ge.qs, ge.d, (const uint8_t *) sc.B_i4, sc.B_scales,
+        nullptr, (void *) sc.gate_f16, (int) M, (int) N, (int) N_pad, (int) K, s_dst);
+    if (fuse_fwht_s4) {
+        // EPI_MODE == 3: write SwiGLU(gate, up) as FP16 in-place into sc.gate_f16 (2x less DRAM write!), then FWHT(1024)->B_s4!
+        launch_pq2_prefill_s4_128x128x256<3>(
+            grid, stream, ue.qs, ue.d, (const uint8_t *) sc.B_i4, sc.B_scales,
+            (const void *) sc.gate_f16, (void *) sc.gate_f16, (int) M, (int) N, (int) N_pad, (int) K, s_dst);
+        const size_t need_b_out = (size_t) N_pad * (size_t) (M >> 3) * sizeof(uint32_t);
+        if (sc.cap_b < need_b_out) {
+            if (!allow_alloc) { return false; }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (sc.B_i4) { CUDA_CHECK(cudaFree(sc.B_i4)); }
+            CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b_out));
+            sc.cap_b = need_b_out;
+        }
+        mul_signs_fwht1024_to_s4_f16_kernel<<<(unsigned) N_pad, (unsigned) ((M >> 10) * 32), 0, stream>>>(
+            sc.gate_f16, (const float *) fwht_signs->data, sc.B_i4, sc.B_scales,
+            (int) M, (int) N, (int) N_pad, s_dst, ggml_cuda_pq2_prefill_int4_clip());
+        sc.src1_data   = fwht_out->data;
+        sc.src1_nbytes = ggml_nbytes(fwht_out);
+        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true;
+    } else {
+        launch_pq2_prefill_s4_128x128x256<2>(
+            grid, stream, ue.qs, ue.d, (const uint8_t *) sc.B_i4, sc.B_scales,
+            (const void *) sc.gate_f16, (void *) dst->data, (int) M, (int) N, (int) N_pad, (int) K, s_dst);
+        pq2_prefill_i4_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// 1-pass ZERO-SMEM float2 (LDG.64 + 32B full-sector STG.32) warp-parallel [ADD +] RMS_NORM + MUL(w) + MUL(signs) + FWHT(1024) -> B_s4!
+__global__ static void rms_mul_signs_fwht1024_to_s4_kernel(
+        const float * __restrict__ src, const float * __restrict__ opt_add_b, float * __restrict__ opt_add_out,
+        const float * __restrict__ rms_w, const float eps,
+        const float * __restrict__ signs, float * __restrict__ opt_mul_w_out, half * __restrict__ opt_mul_w_f16,
+        uint32_t * __restrict__ dst_s4, float * __restrict__ out_col_scales,
+        const int M, const int N, const int N_pad, const int64_t s11, const float clip_sigma) {
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid   = threadIdx.x;
+    const int warp  = tid >> 5;
+    const int lane  = tid & 31;
+    const int n_blk = M >> 10;
+    uint32_t * out32 = dst_s4 + (int64_t) j * (M >> 3);
+    if (j >= N) {
+        if (tid == 0) { out_col_scales[j] = 0.0f; }
+        for (int i = tid; i < (M >> 3); i += blockDim.x) { out32[i] = 0u; }
+        return;
+    }
+    const float2 * in_col2  = (const float2 *) (src + (int64_t) j * s11);
+    const float2 * add_b2   = opt_add_b   ? (const float2 *) (opt_add_b   + (int64_t) j * M) : nullptr;
+    float2       * add_out2 = opt_add_out ? (float2       *) (opt_add_out + (int64_t) j * M) : nullptr;
+    const float2 * rw2      = (const float2 *) rms_w;
+    const float2 * sgn2     = (const float2 *) signs;
+    float v0[16], v1[16];
+    float sq_in = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const int idx2 = warp * 512 + k * 32 + lane;
+        float2 x = in_col2[idx2];
+        if (add_b2) {
+            const float2 b = add_b2[idx2];
+            x.x += b.x; x.y += b.y;
+            if (add_out2) { add_out2[idx2] = x; }
+        }
+        v0[k] = x.x; v1[k] = x.y;
+        sq_in += x.x * x.x + x.y * x.y;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) { sq_in += __shfl_xor_sync(0xFFFFFFFF, sq_in, off); }
+    __shared__ float smax[24], ssq[24];
+    if (lane == 0) { ssq[warp] = sq_in; }
+    __syncthreads();
+    float tot_in_sq = 0.0f;
+    for (int w = 0; w < n_blk; ++w) { tot_in_sq += ssq[w]; }
+    const float irms = rsqrtf(tot_in_sq / (float) M + eps);
+    float2 * mw_col2     = opt_mul_w_out ? (float2 *) (opt_mul_w_out + (int64_t) j * M) : nullptr;
+    half2  * mw_f16_col2 = opt_mul_w_f16 ? (half2  *) (opt_mul_w_f16 + (int64_t) j * M) : nullptr;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const int idx2 = warp * 512 + k * 32 + lane;
+        const float2 w = __ldg(rw2 + idx2);
+        const float2 s = __ldg(sgn2 + idx2);
+        const float mw0 = v0[k] * irms * w.x;
+        const float mw1 = v1[k] * irms * w.y;
+        if (mw_col2)     { mw_col2[idx2]     = make_float2(mw0, mw1); }
+        if (mw_f16_col2) { mw_f16_col2[idx2] = __floats2half2_rn(mw0, mw1); }
+        const float x0 = mw0 * s.x;
+        const float x1 = mw1 * s.y;
+        v0[k] = x0 + x1;
+        v1[k] = x0 - x1;
+    }
+#pragma unroll
+    for (int h = 1; h < 16; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 16; k += (h << 1)) {
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a0 = v0[k + r], b0 = v0[k + r + h];
+                v0[k + r] = a0 + b0; v0[k + r + h] = a0 - b0;
+                const float a1 = v1[k + r], b1 = v1[k + r + h];
+                v1[k + r] = a1 + b1; v1[k + r + h] = a1 - b1;
+            }
+        }
+    }
+    float cmax = 0.0f, csq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        float x0 = v0[k], x1 = v1[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float y0 = __shfl_xor_sync(0xFFFFFFFF, x0, h);
+            const float y1 = __shfl_xor_sync(0xFFFFFFFF, x1, h);
+            x0 = ((lane & h) == 0) ? (x0 + y0) : (y0 - x0);
+            x1 = ((lane & h) == 0) ? (x1 + y1) : (y1 - x1);
+        }
+        v0[k] = x0; v1[k] = x1;
+        cmax = fmaxf(cmax, fmaxf(fabsf(x0), fabsf(x1)));
+        csq += x0 * x0 + x1 * x1;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+        csq += __shfl_xor_sync(0xFFFFFFFF, csq,  off);
+    }
+    __syncthreads();
+    if (lane == 0) { smax[warp] = cmax; ssq[warp] = csq; }
+    __syncthreads();
+    float max_v = 0.0f, tot_sq = 0.0f;
+    for (int w = 0; w < n_blk; ++w) {
+        max_v  = fmaxf(max_v, smax[w]);
+        tot_sq += ssq[w];
+    }
+    const float rms = sqrtf(tot_sq / (float) M);
+    const float c   = (clip_sigma > 0.0f) ? fminf(max_v, clip_sigma * rms) : max_v;
+    const float inv_scale = c > 0.0f ? (7.0f / c) : 0.0f;
+    if (tid == 0) { out_col_scales[j] = (c * (1.0f / 7.0f)) * (1.0f / 32.0f); }
+    uint32_t * out_blk = out32 + warp * 128;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        uint32_t q = ((uint32_t)(max(-8, min(7, __float2int_rn(v0[k] * inv_scale))) & 0xF))
+                   | (((uint32_t)(max(-8, min(7, __float2int_rn(v1[k] * inv_scale))) & 0xF)) << 4);
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 8;
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 16;
+        if ((lane & 3) == 0) { out_blk[k * 8 + (lane >> 2)] = q; }
+    }
+}
+
+// 1-pass ZERO-SMEM warp-parallel MUL(signs) + FWHT(1024) -> RMS-clipped INT4 B_s4 (1 warp per 1024-block, M <= 18432!)
+__global__ static void mul_signs_fwht1024_to_s4_kernel(
+        const float * __restrict__ src, const float * __restrict__ signs,
+        uint32_t * __restrict__ dst_s4, float * __restrict__ out_col_scales,
+        const int M, const int N, const int N_pad, const int64_t s11, const float clip_sigma) {
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid   = threadIdx.x;
+    const int warp  = tid >> 5;
+    const int lane  = tid & 31;
+    const int n_blk = M >> 10;
+    uint32_t * out32 = dst_s4 + (int64_t) j * (M >> 3);
+    if (j >= N) {
+        if (tid == 0) { out_col_scales[j] = 0.0f; }
+        for (int i = tid; i < (M >> 3); i += blockDim.x) { out32[i] = 0u; }
+        return;
+    }
+    const float * in_col = src + (int64_t) j * s11;
+    float v[32];
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const int idx = warp * 1024 + k * 32 + lane;
+        v[k] = in_col[idx] * signs[idx];
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1)) {
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+        }
+    }
+    float cmax = 0.0f, csq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+        cmax = fmaxf(cmax, fabsf(x));
+        csq += x * x;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+        csq += __shfl_xor_sync(0xFFFFFFFF, csq,  off);
+    }
+    __shared__ float smax[24], ssq[24];
+    if (lane == 0) { smax[warp] = cmax; ssq[warp] = csq; }
+    __syncthreads();
+    float max_v = 0.0f, tot_sq = 0.0f;
+    for (int w = 0; w < n_blk; ++w) {
+        max_v  = fmaxf(max_v, smax[w]);
+        tot_sq += ssq[w];
+    }
+    const float rms = sqrtf(tot_sq / (float) M);
+    const float c   = (clip_sigma > 0.0f) ? fminf(max_v, clip_sigma * rms) : max_v;
+    const float inv_scale = c > 0.0f ? (7.0f / c) : 0.0f;
+    if (tid == 0) { out_col_scales[j] = (c * (1.0f / 7.0f)) * (1.0f / 32.0f); }
+    uint32_t * out_blk = out32 + warp * 128;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        uint32_t q = (uint32_t)(max(-8, min(7, __float2int_rn(v[k] * inv_scale))) & 0xF);
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 4;
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 8;
+        q |= __shfl_down_sync(0xFFFFFFFF, q, 4) << 16;
+        if ((lane & 7) == 0) { out_blk[k * 4 + (lane >> 3)] = q; }
+    }
+}
+
+struct pq2_narrow_i8_scratch {
+    uint32_t   * B_i8        = nullptr;
+    int32_t    * B_sum       = nullptr;
+    float      * B_scales    = nullptr;
+    size_t       cap_b       = 0;
+    size_t       cap_sum     = 0;
+    size_t       cap_sc      = 0;
+    const void * src1_data   = nullptr;
+    size_t       src1_nbytes = 0;
+    int64_t      N           = 0;
+    int64_t      K           = 0;
+    int64_t      s11         = 0;
+    uint64_t     gen         = 0;
+    bool         valid       = false;
+};
+
+static pq2_narrow_i8_scratch & pq2_narrow_i8_scratch_for_stream(cudaStream_t stream) {
+    static std::mutex mu;
+    static std::unordered_map<cudaStream_t, pq2_narrow_i8_scratch> map;
+    std::lock_guard<std::mutex> lock(mu);
+    return map[stream];
+}
+
+static void pq2_narrow_i8_cache_invalidate(cudaStream_t stream) {
+    pq2_narrow_i8_scratch_for_stream(stream).valid = false;
+}
+
+static void pq2_narrow_i8_cache_invalidate_if_overlap(cudaStream_t stream, const void * dst_data, size_t dst_nbytes) {
+    if (!dst_data || dst_nbytes == 0) { return; }
+    const uintptr_t b0 = (uintptr_t) dst_data, b1 = b0 + dst_nbytes;
+    auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+    if (sc.valid) {
+        const uintptr_t a0 = (uintptr_t) sc.src1_data, a1 = a0 + sc.src1_nbytes;
+        if (a0 < b1 && b0 < a1) { sc.valid = false; }
+    }
+}
+
+static void pq2_prefill_i4_cache_invalidate(cudaStream_t stream) {
+    auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+    sc.valid = false;
+    sc.mw_valid = false;
+}
+
+static void pq2_prefill_i4_cache_invalidate_if_overlap(cudaStream_t stream, const void * dst_data, size_t dst_nbytes) {
+    if (!dst_data || dst_nbytes == 0) { return; }
+    const uintptr_t b0 = (uintptr_t) dst_data, b1 = b0 + dst_nbytes;
+    auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+    if (sc.valid) {
+        const uintptr_t a0 = (uintptr_t) sc.src1_data, a1 = a0 + sc.src1_nbytes;
+        if (a0 < b1 && b0 < a1) { sc.valid = false; }
+    }
+    if (sc.mw_valid) {
+        const uintptr_t a0 = (uintptr_t) sc.mw_data, a1 = a0 + sc.mw_nbytes;
+        if (a0 < b1 && b0 < a1) { sc.mw_valid = false; }
+    }
+}
+
+__global__ static void f32_to_f16_1d_kernel(const float * __restrict__ src, half * __restrict__ dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] = __float2half(src[i]); }
+}
+
+static bool ggml_cuda_mul_mat_f32_narrow_f16_tc(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) { return false; }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    if (N < 17 || N > 64 || M > 64 || K < 512 || (K % 4) != 0 ||
+            strstr(src0->name, "lora") != nullptr ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) { return false; }
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap);
+    const bool allow_alloc = (cap == cudaStreamCaptureStatusNone);
+
+    static std::mutex w_mu;
+    static std::unordered_map<const void *, half *> w_f16_cache;
+    half * w_f16 = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(w_mu);
+        auto it = w_f16_cache.find(src0->data);
+        if (it != w_f16_cache.end()) {
+            w_f16 = it->second;
+        } else {
+            if (!allow_alloc) { return false; }
+            const int64_t n_el = M * K;
+            CUDA_CHECK(cudaMalloc(&w_f16, (size_t) n_el * sizeof(half)));
+            f32_to_f16_1d_kernel<<<(unsigned) ((n_el + 255) / 256), 256, 0, stream>>>((const float *) src0->data, w_f16, n_el);
+            w_f16_cache[src0->data] = w_f16;
+        }
+    }
+    struct x_f16_buf { half * ptr = nullptr; size_t cap = 0; const void * src1 = nullptr; int64_t N = 0, K = 0; };
+    static std::mutex x_mu;
+    static std::unordered_map<cudaStream_t, x_f16_buf> x_map;
+    x_f16_buf * xb = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(x_mu);
+        xb = &x_map[stream];
+    }
+    const size_t need_el = (size_t) N * (size_t) K;
+    if (xb->cap < need_el) {
+        if (!allow_alloc) { return false; }
+        const size_t alloc_el = std::max(need_el, (size_t) 64 * 8192);
+        if (xb->ptr) { CUDA_CHECK(cudaFree(xb->ptr)); }
+        CUDA_CHECK(cudaMalloc(&xb->ptr, alloc_el * sizeof(half)));
+        xb->cap = alloc_el;
+    }
+    f32_to_f16_1d_kernel<<<(unsigned) ((need_el + 255) / 256), 256, 0, stream>>>((const float *) src1->data, xb->ptr, (int64_t) need_el);
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+    CUBLAS_CHECK(cublasGemmEx(
+        ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        (int) M, (int) N, (int) K,
+        &alpha, w_f16, CUDA_R_16F, (int) K,
+        xb->ptr, CUDA_R_16F, (int) K,
+        &beta, dst->data, CUDA_R_32F, (int) M,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_f32_prefill_f16_tc(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!ggml_cuda_pq2_prefill_int4_enabled()) { return false; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) { return false; }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    if (N < 256 || M > 64 || strstr(src0->name, "lora") != nullptr ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) { return false; }
+    cudaStream_t stream = ctx.stream();
+    auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+    if (!(sc.mw_valid && sc.mw_data == src1->data && sc.mw_N == N && sc.mw_K == K && sc.mul_w_f16)) { return false; }
+    static std::mutex w_mu;
+    static std::unordered_map<const void *, half *> w_f16_cache;
+    half * w_f16 = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(w_mu);
+        auto it = w_f16_cache.find(src0->data);
+        if (it != w_f16_cache.end()) {
+            w_f16 = it->second;
+        } else {
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            (void) cudaStreamIsCapturing(stream, &cap);
+            if (cap != cudaStreamCaptureStatusNone) { return false; }
+            const int64_t n_el = M * K;
+            CUDA_CHECK(cudaMalloc(&w_f16, (size_t) n_el * sizeof(half)));
+            f32_to_f16_1d_kernel<<<(unsigned) ((n_el + 255) / 256), 256, 0, stream>>>((const float *) src0->data, w_f16, n_el);
+            w_f16_cache[src0->data] = w_f16;
+        }
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+    CUBLAS_CHECK(cublasGemmEx(
+        ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        (int) M, (int) N, (int) K,
+        &alpha, w_f16, CUDA_R_16F, (int) K,
+        sc.mul_w_f16, CUDA_R_16F, (int) K,
+        &beta, dst->data, CUDA_R_32F, (int) M,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    pq2_prefill_i4_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    return true;
+}
+
+static int64_t pq2_narrow_i8_max_n() {
+    static const int64_t env_n = []() -> int64_t {
+        const char * v = getenv("GGML_CUDA_PQ2_NARROW_MAX_N");
+        return v ? (int64_t) atoi(v) : 0;
+    }();
+    if (env_n > 0) { return env_n; }
+    return ggml_cuda_pq2_prefill_int4_enabled() ? 255 : 512;
+}
+
+static int64_t pq2_narrow_i8_n_pad(int64_t N) {
+    return (N <= 8) ? 8 : ((N <= 16) ? 16 : ((N <= 24) ? 24 : ((N <= 32) ? 32 : ((N + 63) / 64) * 64)));
+}
+
+__device__ __forceinline__ void fwht1024_pack_2nibble_warp(
+        const float v[32], const int warp, const int lane,
+        uint32_t * __restrict__ out32, int32_t * __restrict__ out_s, float * __restrict__ out_sc) {
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        const float x0 = v[b * 4 + 0];
+        const float x1 = v[b * 4 + 1];
+        const float x2 = v[b * 4 + 2];
+        const float x3 = v[b * 4 + 3];
+        float bmax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { bmax = fmaxf(bmax, __shfl_xor_sync(0xFFFFFFFF, bmax, off)); }
+        const float inv_s = bmax > 0.0f ? (119.0f / bmax) : 0.0f;
+        const int q0 = max(-120, min(119, __float2int_rn(x0 * inv_s)));
+        const int q1 = max(-120, min(119, __float2int_rn(x1 * inv_s)));
+        const int q2 = max(-120, min(119, __float2int_rn(x2 * inv_s)));
+        const int q3 = max(-120, min(119, __float2int_rn(x3 * inv_s)));
+        int s = q0 + q1 + q2 + q3;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { s += __shfl_xor_sync(0xFFFFFFFF, s, off); }
+        const int kb = warp * 8 + b;
+        if (lane == 0) {
+            out_s[kb]  = s;
+            out_sc[kb] = (bmax / 119.0f) * (1.0f / 32.0f);
+        }
+        const int qs[4] = { q0, q1, q2, q3 };
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int q  = qs[c];
+            const int lo = ((q + 8) & 15) - 8;
+            const int hi = (q - lo) >> 4;
+            uint32_t wh = (uint32_t)(hi & 0xF);
+            uint32_t wl = (uint32_t)(lo & 0xF);
+            wh |= __shfl_down_sync(0xFFFFFFFF, wh, 1) << 4;
+            wl |= __shfl_down_sync(0xFFFFFFFF, wl, 1) << 4;
+            wh |= __shfl_down_sync(0xFFFFFFFF, wh, 2) << 8;
+            wl |= __shfl_down_sync(0xFFFFFFFF, wl, 2) << 8;
+            wh |= __shfl_down_sync(0xFFFFFFFF, wh, 4) << 16;
+            wl |= __shfl_down_sync(0xFFFFFFFF, wl, 4) << 16;
+            if ((lane & 7) == 0) {
+                const int kw = ((lane >> 3) << 2) | c;
+                out32[(kb << 5) + kw]      = wh;
+                out32[(kb << 5) + 16 + kw] = wl;
+            }
+        }
+    }
+}
+
+__global__ static void mul_signs_fwht1024_to_narrow_i8_kernel(
+        const float * __restrict__ src, const float * __restrict__ signs,
+        uint32_t * __restrict__ dst_i8, int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
+        const int M, const int N, const int N_pad, const int64_t s11) {
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int K4 = M >> 2, n_kblk = M >> 7;
+    uint32_t * out32  = dst_i8        + (int64_t) j * K4;
+    int32_t  * out_s  = dst_sum128    + (int64_t) j * n_kblk;
+    float    * out_sc = dst_scales128 + (int64_t) j * n_kblk;
+    if (j >= N) {
+        for (int i = tid; i < K4; i += blockDim.x) { out32[i] = 0u; }
+        for (int i = tid; i < n_kblk; i += blockDim.x) { out_s[i] = 0; out_sc[i] = 0.0f; }
+        return;
+    }
+    const float * in_col = src + (int64_t) j * s11;
+    float v[32];
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const int idx = warp * 1024 + k * 32 + lane;
+        v[k] = in_col[idx] * __ldg(signs + idx);
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1)
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1))
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+    }
+    fwht1024_pack_2nibble_warp(v, warp, lane, out32, out_s, out_sc);
+}
+
+__global__ static void rms_mul_signs_fwht1024_to_narrow_i8_kernel(
+        const float * __restrict__ src, const float * __restrict__ opt_add_b, float * __restrict__ opt_add_out,
+        const float * __restrict__ rms_w, const float eps,
+        const float * __restrict__ signs, float * __restrict__ opt_mul_w_out,
+        uint32_t * __restrict__ dst_i8, int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
+        const int M, const int N, const int N_pad, const int64_t s11) {
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n_blk = M >> 10, K4 = M >> 2, n_kblk = M >> 7;
+    uint32_t * out32  = dst_i8        + (int64_t) j * K4;
+    int32_t  * out_s  = dst_sum128    + (int64_t) j * n_kblk;
+    float    * out_sc = dst_scales128 + (int64_t) j * n_kblk;
+    if (j >= N) {
+        for (int i = tid; i < K4; i += blockDim.x) { out32[i] = 0u; }
+        for (int i = tid; i < n_kblk; i += blockDim.x) { out_s[i] = 0; out_sc[i] = 0.0f; }
+        return;
+    }
+    const float * in_col  = src + (int64_t) j * s11;
+    const float * add_b   = opt_add_b   ? (opt_add_b   + (int64_t) j * M) : nullptr;
+    float       * add_out = opt_add_out ? (opt_add_out + (int64_t) j * M) : nullptr;
+    float v[32];
+    float sq_in = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const int idx = warp * 1024 + k * 32 + lane;
+        float x = in_col[idx];
+        if (add_b) {
+            x += add_b[idx];
+            if (add_out) { add_out[idx] = x; }
+        }
+        v[k] = x;
+        sq_in += x * x;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) { sq_in += __shfl_xor_sync(0xFFFFFFFF, sq_in, off); }
+    __shared__ float ssq[24];
+    if (lane == 0) { ssq[warp] = sq_in; }
+    __syncthreads();
+    float tot_in_sq = 0.0f;
+    for (int w = 0; w < n_blk; ++w) { tot_in_sq += ssq[w]; }
+    const float irms = rsqrtf(tot_in_sq / (float) M + eps);
+    float * mw_col = opt_mul_w_out ? (opt_mul_w_out + (int64_t) j * M) : nullptr;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const int idx = warp * 1024 + k * 32 + lane;
+        const float mw = v[k] * irms * __ldg(rms_w + idx);
+        if (mw_col) { mw_col[idx] = mw; }
+        v[k] = mw * __ldg(signs + idx);
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1)
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1))
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+    }
+    fwht1024_pack_2nibble_warp(v, warp, lane, out32, out_s, out_sc);
+}
+
+static bool pq2_narrow_i8_alloc_bufs(
+        pq2_narrow_i8_scratch & sc, const int64_t N_pad, const int64_t K, cudaStream_t stream) {
+    const size_t need_b   = (size_t) N_pad * (size_t) (K >> 2) * sizeof(uint32_t);
+    const size_t need_sum = (size_t) N_pad * (size_t) (K >> 7) * sizeof(int32_t);
+    const size_t need_sc  = (size_t) N_pad * (size_t) (K >> 7) * sizeof(float);
+    if (sc.cap_b < need_b || sc.cap_sum < need_sum || sc.cap_sc < need_sc) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        (void) cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) { return false; }
+        const size_t alloc_b   = std::max(need_b,   (size_t) 128 * (20480 / 4) * sizeof(uint32_t));
+        const size_t alloc_sum = std::max(need_sum, (size_t) 128 * (20480 / 128) * sizeof(int32_t));
+        const size_t alloc_sc  = std::max(need_sc,  (size_t) 128 * (20480 / 128) * sizeof(float));
+        if (sc.B_i8)     { CUDA_CHECK(cudaFree(sc.B_i8)); }
+        if (sc.B_sum)    { CUDA_CHECK(cudaFree(sc.B_sum)); }
+        if (sc.B_scales) { CUDA_CHECK(cudaFree(sc.B_scales)); }
+        CUDA_CHECK(cudaMalloc(&sc.B_i8, alloc_b));
+        CUDA_CHECK(cudaMalloc(&sc.B_sum, alloc_sum));
+        CUDA_CHECK(cudaMalloc(&sc.B_scales, alloc_sc));
+        sc.cap_b = alloc_b; sc.cap_sum = alloc_sum; sc.cap_sc = alloc_sc;
+        sc.valid = false;
+    }
+    return true;
+}
+
+static bool pq2_narrow_i8_ensure_b(
+        pq2_narrow_i8_scratch & sc, const ggml_tensor * src1,
+        const int64_t N, const int64_t N_pad, const int64_t K, const int64_t s11,
+        cudaStream_t stream, bool allow_alloc) {
+    const size_t need_b   = (size_t) N_pad * (size_t) (K >> 2) * sizeof(uint32_t);
+    const size_t need_sum = (size_t) N_pad * (size_t) (K >> 7) * sizeof(int32_t);
+    const size_t need_sc  = (size_t) N_pad * (size_t) (K >> 7) * sizeof(float);
+    if (sc.cap_b < need_b || sc.cap_sum < need_sum || sc.cap_sc < need_sc) {
+        if (!allow_alloc) { return false; }
+        const size_t alloc_b   = std::max(need_b,   (size_t) 128 * (20480 / 4) * sizeof(uint32_t));
+        const size_t alloc_sum = std::max(need_sum, (size_t) 128 * (20480 / 128) * sizeof(int32_t));
+        const size_t alloc_sc  = std::max(need_sc,  (size_t) 128 * (20480 / 128) * sizeof(float));
+        if (sc.B_i8)     { CUDA_CHECK(cudaFree(sc.B_i8)); }
+        if (sc.B_sum)    { CUDA_CHECK(cudaFree(sc.B_sum)); }
+        if (sc.B_scales) { CUDA_CHECK(cudaFree(sc.B_scales)); }
+        CUDA_CHECK(cudaMalloc(&sc.B_i8, alloc_b));
+        CUDA_CHECK(cudaMalloc(&sc.B_sum, alloc_sum));
+        CUDA_CHECK(cudaMalloc(&sc.B_scales, alloc_sc));
+        sc.cap_b = alloc_b; sc.cap_sum = alloc_sum; sc.cap_sc = alloc_sc;
+        sc.valid = false;
+    }
+    if (!(sc.valid && sc.src1_data == src1->data && sc.N == N && sc.K == K && sc.s11 == s11)) {
+        quantize_f32_to_i8_sum128_kernel<<<(unsigned) N_pad, 512, 0, stream>>>(
+            (const float *) src1->data, sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, (int) K, s11);
+        sc.src1_data   = src1->data;
+        sc.src1_nbytes = ggml_nbytes(src1);
+        sc.N           = N;
+        sc.K           = K;
+        sc.s11         = s11;
+        sc.valid       = true;
+    }
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_pq2_narrow_int8(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * add_src = nullptr) {
+    if (!ggml_cuda_pq2_narrow_int8_enabled()) { return false; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) { return false; }
+    if (src0->type != GGML_TYPE_PQ2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    if (add_src && (add_src->type != GGML_TYPE_F32 || !ggml_are_same_shape(add_src, dst) ||
+            add_src->nb[0] != sizeof(float) || add_src->nb[1] != dst->nb[1])) { return false; }
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    if (N < 5 || N > pq2_narrow_i8_max_n() || M > (N >= 256 ? 65536 : 262144) || (K % 128) != 0 || (M % 8) != 0 ||
+            !ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap_status);
+    const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
+
+    const auto ae = get_or_repack_pq2_tc_i8((const block_pq2_0 *) src0->data, M, K, stream, allow_alloc);
+    if (!ae.qs || !ae.d) { return false; }
+
+    const int64_t N_pad = pq2_narrow_i8_n_pad(N);
+    auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+    const int64_t s11   = src1->nb[1] / sizeof(float);
+    const int64_t s_dst = dst->nb[1] / sizeof(float);
+    if (!pq2_narrow_i8_ensure_b(sc, src1, N, N_pad, K, s11, stream, allow_alloc)) { return false; }
+    const float * add_ptr = add_src ? (const float *) add_src->data : nullptr;
+    // W4 R4 + Split-K for N<=32; 2D warp-tiled uint4 (128 regs, 16 warps/SM) for N=33..128 (100% lossless!)
+    unsigned split_k = 1u;
+    if (M <= 65536 && K >= 2048) {
+        if (N_pad <= 32) {
+            split_k = (M <= 8192) ? 4u : 2u;
+        } else if (N <= 64 && M <= 8192) {
+            split_k = 2u;
+        }
+    }
+    if (split_k > 1u) {
+        const size_t out_bytes = (size_t) N * (size_t) s_dst * sizeof(float);
+        if (!add_ptr) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, out_bytes, stream));
+        } else if (add_ptr != (const float *) dst->data) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, add_ptr, out_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    if (N_pad == 8) {
+        dim3 grid((unsigned) ((M + 127) / 128), 1, split_k);
+        pq2_narrow_int8_v2_kernel<8, 4, 4><<<grid, 128, 0, stream>>>(
+            ae.qs, ae.d, sc.B_i8, sc.B_sum, sc.B_scales, add_ptr, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N_pad == 16) {
+        dim3 grid((unsigned) ((M + 127) / 128), 1, split_k);
+        pq2_narrow_int8_v2_kernel<16, 4, 4><<<grid, 128, 0, stream>>>(
+            ae.qs, ae.d, sc.B_i8, sc.B_sum, sc.B_scales, add_ptr, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N_pad == 24) {
+        dim3 grid((unsigned) ((M + 127) / 128), 1, split_k);
+        pq2_narrow_int8_v2_kernel<24, 4, 4><<<grid, 128, 0, stream>>>(
+            ae.qs, ae.d, sc.B_i8, sc.B_sum, sc.B_scales, add_ptr, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N_pad == 32) {
+        dim3 grid((unsigned) ((M + 127) / 128), 1, split_k);
+        pq2_narrow_int8_v2_kernel<32, 4, 4><<<grid, 128, 0, stream>>>(
+            ae.qs, ae.d, sc.B_i8, sc.B_sum, sc.B_scales, add_ptr, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N >= 129 || (N <= 64 && M <= 8192)) {
+        dim3 grid((unsigned) ((M + 127) / 128), (unsigned) ((N + 63) / 64), split_k);
+        pq2_narrow2d_i8_kernel<4, 2, 4, 4, true><<<grid, 256, 0, stream>>>(
+            ae.qs, ae.d, (const uint4 *) sc.B_i8, sc.B_sum, sc.B_scales, add_ptr, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else {
+        dim3 grid((unsigned) ((M + 63) / 64), (unsigned) ((N + 63) / 64), 1);
+        pq2_narrow2d_i8_kernel<2, 2, 4, 4, false><<<grid, 128, 0, stream>>>(
+            ae.qs, ae.d, (const uint4 *) sc.B_i8, sc.B_sum, sc.B_scales, add_ptr, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    }
+    pq2_narrow_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_pq2_narrow_int8_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+        const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!ggml_cuda_pq2_narrow_int8_enabled()) { return false; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) { return false; }
+    if (gate_w->type != GGML_TYPE_PQ2_0 || up_w->type != GGML_TYPE_PQ2_0 ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) { return false; }
+    if (!ggml_are_same_shape(gate_w, up_w) || gate_w->ne[2] != 1 || gate_w->ne[3] != 1 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1) { return false; }
+    const int64_t K = gate_w->ne[0], M = gate_w->ne[1], N = src1->ne[1];
+    if (N < 5 || N > pq2_narrow_i8_max_n() || M > 262144 || (K % 128) != 0 || (M % 8) != 0 ||
+            !ggml_is_contiguous(gate_w) || !ggml_is_contiguous(up_w) ||
+            src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            ggml_backend_buffer_get_usage(gate_w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap_status);
+    const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
+
+    const auto ge = get_or_repack_pq2_tc_i8((const block_pq2_0 *) gate_w->data, M, K, stream, allow_alloc);
+    const auto ue = get_or_repack_pq2_tc_i8((const block_pq2_0 *) up_w->data,   M, K, stream, allow_alloc);
+    if (!ge.qs || !ge.d || !ue.qs || !ue.d) { return false; }
+
+    const int64_t N_pad = pq2_narrow_i8_n_pad(N);
+    auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+    const int64_t s11   = src1->nb[1] / sizeof(float);
+    const int64_t s_dst = dst->nb[1] / sizeof(float);
+    if (!pq2_narrow_i8_ensure_b(sc, src1, N, N_pad, K, s11, stream, allow_alloc)) { return false; }
+
+    dim3 grid((unsigned) ((M + 63) / 64));
+    if (N_pad == 8) {
+        pq2_narrow_int8_swiglu_v2_kernel<8, 4, 2><<<grid, 128, 0, stream>>>(
+            ge.qs, ge.d, ue.qs, ue.d, sc.B_i8, sc.B_sum, sc.B_scales, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N_pad == 16) {
+        pq2_narrow_int8_swiglu_v2_kernel<16, 4, 2><<<grid, 128, 0, stream>>>(
+            ge.qs, ge.d, ue.qs, ue.d, sc.B_i8, sc.B_sum, sc.B_scales, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N_pad == 24) {
+        pq2_narrow_int8_swiglu_v2_kernel<24, 4, 2><<<grid, 128, 0, stream>>>(
+            ge.qs, ge.d, ue.qs, ue.d, sc.B_i8, sc.B_sum, sc.B_scales, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else if (N_pad == 32) {
+        pq2_narrow_int8_swiglu_v2_kernel<32, 4, 2><<<grid, 128, 0, stream>>>(
+            ge.qs, ge.d, ue.qs, ue.d, sc.B_i8, sc.B_sum, sc.B_scales, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    } else {
+        dim3 grid2((unsigned) ((M + 63) / 64), (unsigned) ((N + 63) / 64));
+        pq2_narrow2d_swiglu_kernel<4, 2, 2, 4, true><<<grid2, 256, 0, stream>>>(
+            ge.qs, ge.d, ue.qs, ue.d, (const uint4 *) sc.B_i8, sc.B_sum, sc.B_scales, (float *) dst->data, (int) M, (int) N, (int) K, s_dst);
+    }
+    pq2_narrow_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+
+__global__ static void compute_pq2_row_scales_kernel(
+        const block_pq2_0 * __restrict__ src0, float * __restrict__ row_scales, float * __restrict__ row_inv_scales,
+        const int M, const int K) {
+    const int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    const int nkb = K / QK_PQ2_0;
+    const block_pq2_0 * row_blk = src0 + (int64_t) row * nkb;
+    const int tid = threadIdx.x;
+
+    float rmax = 0.0f;
+    for (int b = tid; b < nkb; b += blockDim.x) {
+        rmax = fmaxf(rmax, fabsf(__half2float(row_blk[b].d)));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFF, rmax, off));
+    }
+    __shared__ float smax[8];
+    if ((tid & 31) == 0) {
+        smax[tid >> 5] = rmax;
+    }
+    __syncthreads();
+    if (tid < 8) {
+        float v = smax[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float max_d = smax[0];
+        row_scales[row]     = max_d / 127.0f;
+        row_inv_scales[row] = max_d > 0.0f ? (127.0f / max_d) : 0.0f;
+    }
+}
+
+__global__ static void dequant_pq2_to_i8_1pass_kernel(
+        const block_pq2_0 * __restrict__ src0, const float * __restrict__ row_inv_scales,
+        int8_t * __restrict__ dst_i8, const int M, const int nkb) {
+    const int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    const float inv_scale = row_inv_scales[row];
+    const block_pq2_0 * row_blk = src0 + (int64_t) row * nkb;
+    int8_t * out_row = dst_i8 + (int64_t) row * (nkb * QK_PQ2_0);
+    const int total_q = nkb * 4;
+    for (int idx = threadIdx.x; idx < total_q; idx += blockDim.x) {
+        const int b  = idx >> 2;
+        const int kq = idx & 3;
+        const block_pq2_0 * blk = row_blk + b;
+        const float df = __half2float(blk->d);
+        const int s_i8  = max(-127, min(127, __float2int_rn(df * inv_scale)));
+        const int s_neg = max(-127, min(127, -s_i8));
+        const int s_2   = max(-127, min(127, 2 * s_i8));
+        const uint32_t lut =
+            ((uint32_t) (uint8_t) (int8_t) s_neg) |
+            (0u << 8) |
+            (((uint32_t) (uint8_t) (int8_t) s_i8) << 16) |
+            (((uint32_t) (uint8_t) (int8_t) s_2)  << 24);
+
+        const uint8_t * qsi = blk->qs + kq * 8;
+        const uint32_t mis  = (uint32_t) ((uintptr_t) qsi & 3);
+        const uint32_t * qwi = (const uint32_t *) (qsi - mis);
+        const uint32_t w0 = qwi[0], w1 = qwi[1], w2 = qwi[1 + mis / 2];
+        const uint32_t sh = 8 * mis;
+        const uint32_t qw[2] = { __funnelshift_r(w0, w1, sh), __funnelshift_r(w1, w2, sh) };
+
+        int v[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q  = (j & 1) == 0 ? int(int16_t(qw[j / 2] & 0xFFFFu)) : int(qw[j / 2]) >> 16;
+            const int qe = __byte_perm(lut, lut, q >> 0);
+            const int qo = __byte_perm(lut, lut, q >> 2);
+            v[2 * j + 0] = __byte_perm(qe, qo, 0x5140);
+            v[2 * j + 1] = __byte_perm(qe, qo, 0x7362);
+        }
+        int4 * out4 = (int4 *) (out_row + b * 128 + kq * 32);
+        out4[0] = make_int4(v[0], v[1], v[2], v[3]);
+        out4[1] = make_int4(v[4], v[5], v[6], v[7]);
+    }
+}
+
+struct pq2_row_scale_cache_entry {
+    float  * scales;
+    float  * inv_scales;
+    int8_t * A_i8;
+    int64_t  M;
+    int64_t  K;
+};
+
+static size_t ggml_cuda_pq2_cache_i8_max_bytes() {
+    static const size_t max_bytes = []() -> size_t {
+        const char * v = getenv("GGML_CUDA_PQ2_CACHE_MB");
+        if (v != nullptr) {
+            long mb = atol(v);
+            return mb > 0 ? (size_t) mb * 1024ull * 1024ull : 0ull;
+        }
+        const char * en = getenv("GGML_CUDA_PQ2_CACHE_I8");
+        if (en != nullptr && atoi(en) != 0) {
+            return 26000ull * 1024ull * 1024ull; // 26 GB default cap when enabled
+        }
+        return 0ull;
+    }();
+    return max_bytes;
+}
+
+static pq2_row_scale_cache_entry get_or_compute_pq2_row_scales(
+        const block_pq2_0 * src0_data, const int64_t M, const int64_t K, cudaStream_t stream) {
+    static std::mutex mu;
+    static std::unordered_map<const void *, pq2_row_scale_cache_entry> cache;
+    static size_t cached_i8_bytes = 0;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(src0_data);
+    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+        return it->second;
+    }
+    pq2_row_scale_cache_entry e{};
+    e.M = M;
+    e.K = K;
+    e.A_i8 = nullptr;
+    CUDA_CHECK(cudaMalloc(&e.scales,     (size_t) M * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&e.inv_scales, (size_t) M * sizeof(float)));
+    compute_pq2_row_scales_kernel<<<(unsigned) M, 256, 0, stream>>>(src0_data, e.scales, e.inv_scales, (int) M, (int) K);
+    const size_t need_bytes = (size_t) M * (size_t) K;
+    const size_t max_bytes  = ggml_cuda_pq2_cache_i8_max_bytes();
+    if (max_bytes > 0 && cached_i8_bytes + need_bytes <= max_bytes) {
+        int8_t * ptr = nullptr;
+        if (cudaMalloc(&ptr, need_bytes) == cudaSuccess) {
+            const int nkb = (int) (K / QK_PQ2_0);
+            dequant_pq2_to_i8_1pass_kernel<<<(unsigned) M, 256, 0, stream>>>(
+                src0_data, e.inv_scales, ptr, (int) M, nkb);
+            e.A_i8 = ptr;
+            cached_i8_bytes += need_bytes;
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    cache[src0_data] = e;
+    return e;
+}
+
+// 1-entry activation (B_i8 + col_scales) cache per stream across sibling matmuls
+// (e.g. attn_qkv + attn_gate, attn_q + attn_k + attn_v, ssm_alpha + ssm_beta).
+struct pq2_b_i8_cache_state {
+    const void * src1_data = nullptr;
+    size_t       src1_nbytes = 0;
+    int64_t      N = 0;
+    int64_t      K = 0;
+    int64_t      s11 = 0;
+    int8_t     * B_i8 = nullptr;
+    size_t       B_i8_cap = 0;
+    float      * col_scales = nullptr;
+    size_t       col_scales_cap = 0;
+    bool         valid = false;
+};
+
+static pq2_b_i8_cache_state & pq2_b_i8_cache_for_stream(cudaStream_t stream) {
+    static std::mutex mu;
+    static std::unordered_map<cudaStream_t, pq2_b_i8_cache_state> map;
+    std::lock_guard<std::mutex> lock(mu);
+    return map[stream];
+}
+
+static void pq2_b_i8_cache_invalidate(cudaStream_t stream) {
+    pq2_b_i8_cache_for_stream(stream).valid = false;
+}
+
+static void pq2_b_i8_cache_invalidate_if_overlap(cudaStream_t stream, const void * dst_data, size_t dst_nbytes) {
+    auto & st = pq2_b_i8_cache_for_stream(stream);
+    if (!st.valid || !dst_data || dst_nbytes == 0) {
+        return;
+    }
+    const char * a0 = (const char *) st.src1_data;
+    const char * a1 = a0 + st.src1_nbytes;
+    const char * b0 = (const char *) dst_data;
+    const char * b1 = b0 + dst_nbytes;
+    if (a0 < b1 && b0 < a1) {
+        st.valid = false;
+    }
+}
+
+static bool pq2_b_i8_cache_enabled() {
+    static const bool en = []() {
+        const char * v = getenv("GGML_CUDA_PQ2_CACHE_B");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return en;
+}
+
+// Quantize static thin F32 weight [K, M] (e.g. 5120x48 ssm_alpha/beta) to row-wise INT8 ONCE and cache it!
+__global__ static void quantize_f32_weight_to_i8_rowwise_kernel(
+        const float * __restrict__ src0, int8_t * __restrict__ dst_i8, float * __restrict__ row_scales,
+        const int M, const int K) {
+    const int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    const float4 * in4 = (const float4 *) (src0 + (int64_t) row * K);
+    const int K4 = K >> 2;
+    const int tid = threadIdx.x;
+    float rmax = 0.0f;
+    for (int i = tid; i < K4; i += blockDim.x) {
+        const float4 x = in4[i];
+        rmax = fmaxf(rmax, fabsf(x.x));
+        rmax = fmaxf(rmax, fabsf(x.y));
+        rmax = fmaxf(rmax, fabsf(x.z));
+        rmax = fmaxf(rmax, fabsf(x.w));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        rmax = fmaxf(rmax, __shfl_xor_sync(0xFFFFFFFF, rmax, off));
+    }
+    __shared__ float smax[8];
+    if ((tid & 31) == 0) {
+        smax[tid >> 5] = rmax;
+    }
+    __syncthreads();
+    if (tid < 8) {
+        float v = smax[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float scale = max_v / 127.0f;
+    const float inv_s = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        row_scales[row] = scale;
+    }
+    char4 * out4 = (char4 *) (dst_i8 + (int64_t) row * K);
+    for (int i = tid; i < K4; i += blockDim.x) {
+        const float4 x = in4[i];
+        char4 q;
+        q.x = (int8_t) __float2int_rn(x.x * inv_s);
+        q.y = (int8_t) __float2int_rn(x.y * inv_s);
+        q.z = (int8_t) __float2int_rn(x.z * inv_s);
+        q.w = (int8_t) __float2int_rn(x.w * inv_s);
+        out4[i] = q;
+    }
+}
+
+struct thin_f32_i8_cache_entry {
+    int8_t * A_i8;
+    float  * scales;
+    int64_t  M;
+    int64_t  K;
+};
+
+static thin_f32_i8_cache_entry get_or_quantize_thin_f32(
+        const float * src0_data, const int64_t M, const int64_t K, cudaStream_t stream) {
+    static std::mutex mu;
+    static std::unordered_map<const void *, thin_f32_i8_cache_entry> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(src0_data);
+    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+        return it->second;
+    }
+    thin_f32_i8_cache_entry e{};
+    e.M = M;
+    e.K = K;
+    CUDA_CHECK(cudaMalloc(&e.A_i8,   (size_t) M * K));
+    CUDA_CHECK(cudaMalloc(&e.scales, (size_t) M * sizeof(float)));
+    quantize_f32_weight_to_i8_rowwise_kernel<<<(unsigned) M, 256, 0, stream>>>(src0_data, e.A_i8, e.scales, (int) M, (int) K);
+    cache[src0_data] = e;
+    return e;
+}
+
+__global__ static void quantize_f32_to_i8_colwise_kernel(
+        const float * __restrict__ src1, int8_t * __restrict__ dst_i8, float * __restrict__ col_scales,
+        const int N, const int K, const int64_t s11);
+
+static void get_or_quantize_b_i8(
+        const ggml_tensor * src1, const int64_t N, const int64_t N_pad, const int64_t K, const int64_t s11,
+        cudaStream_t stream, int8_t * & B_i8_out, float * & col_scales_out) {
+    auto & st = pq2_b_i8_cache_for_stream(stream);
+    if (pq2_b_i8_cache_enabled() && st.valid &&
+            st.src1_data == src1->data && st.N == N && st.K == K && st.s11 == s11) {
+        B_i8_out = st.B_i8;
+        col_scales_out = st.col_scales;
+        return;
+    }
+    const size_t need_b = (size_t) N_pad * (size_t) K;
+    const size_t need_s = (size_t) N_pad * sizeof(float);
+    if (st.B_i8_cap < need_b) {
+        if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+        CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+        st.B_i8_cap = need_b;
+    }
+    if (st.col_scales_cap < need_s) {
+        if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+        CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+        st.col_scales_cap = need_s;
+    }
+    quantize_f32_to_i8_colwise_kernel<<<(unsigned) N, 512, 0, stream>>>(
+        (const float *) src1->data, st.B_i8, st.col_scales, (int) N, (int) K, s11);
+    st.src1_data   = src1->data;
+    st.src1_nbytes = ggml_nbytes(src1);
+    st.N           = N;
+    st.K           = K;
+    st.s11         = s11;
+    st.valid       = pq2_b_i8_cache_enabled();
+    B_i8_out       = st.B_i8;
+    col_scales_out = st.col_scales;
+}
+
+__global__ static void quantize_f32_to_i8_colwise_kernel(
+        const float * __restrict__ src1, int8_t * __restrict__ dst_i8, float * __restrict__ col_scales,
+        const int N, const int K, const int64_t s11) {
+    const int col = blockIdx.x;
+    if (col >= N) {
+        return;
+    }
+    const float * in_col = src1 + (int64_t) col * s11;
+    const int tid = threadIdx.x;
+    const int K4 = K >> 2;
+    const float4 * in4 = (const float4 *) in_col;
+
+    // Single-pass register cache for K <= 20480 (512 threads * 10 float4 = 20480 floats):
+    // reads src1 ONCE from DRAM instead of TWICE!
+    constexpr int MAX_REG = 10;
+    float4 reg[MAX_REG];
+    const bool use_reg = (K4 <= (int) blockDim.x * MAX_REG);
+
+    float cmax = 0.0f;
+    if (use_reg) {
+#pragma unroll
+        for (int r = 0; r < MAX_REG; ++r) {
+            const int i = r * blockDim.x + tid;
+            if (i < K4) {
+                const float4 x = in4[i];
+                reg[r] = x;
+                cmax = fmaxf(cmax, fabsf(x.x));
+                cmax = fmaxf(cmax, fabsf(x.y));
+                cmax = fmaxf(cmax, fabsf(x.z));
+                cmax = fmaxf(cmax, fabsf(x.w));
+            }
+        }
+    } else {
+        for (int i = tid; i < K4; i += blockDim.x) {
+            const float4 x = in4[i];
+            cmax = fmaxf(cmax, fabsf(x.x));
+            cmax = fmaxf(cmax, fabsf(x.y));
+            cmax = fmaxf(cmax, fabsf(x.z));
+            cmax = fmaxf(cmax, fabsf(x.w));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    __shared__ float smax[16];
+    if ((tid & 31) == 0) {
+        smax[tid >> 5] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = (tid < (int)(blockDim.x >> 5)) ? smax[tid] : 0.0f;
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float scale_col = max_v / 127.0f;
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        col_scales[col] = scale_col;
+    }
+
+    char4 * out4 = (char4 *) (dst_i8 + (int64_t) col * K);
+    if (use_reg) {
+#pragma unroll
+        for (int r = 0; r < MAX_REG; ++r) {
+            const int i = r * blockDim.x + tid;
+            if (i < K4) {
+                const float4 x = reg[r];
+                char4 q;
+                q.x = (int8_t) __float2int_rn(x.x * inv_scale);
+                q.y = (int8_t) __float2int_rn(x.y * inv_scale);
+                q.z = (int8_t) __float2int_rn(x.z * inv_scale);
+                q.w = (int8_t) __float2int_rn(x.w * inv_scale);
+                out4[i] = q;
+            }
+        }
+    } else {
+        for (int i = tid; i < K4; i += blockDim.x) {
+            const float4 x = in4[i];
+            char4 q;
+            q.x = (int8_t) __float2int_rn(x.x * inv_scale);
+            q.y = (int8_t) __float2int_rn(x.y * inv_scale);
+            q.z = (int8_t) __float2int_rn(x.z * inv_scale);
+            q.w = (int8_t) __float2int_rn(x.w * inv_scale);
+            out4[i] = q;
+        }
+    }
+}
+
+__global__ static void dequant_i32_to_f32_epilogue_kernel(
+        const int32_t * __restrict__ src_i32, const float * __restrict__ row_scales, const float * __restrict__ col_scales,
+        const float * __restrict__ add_src, float * __restrict__ dst, const int M, const int N, const int64_t s_dst) {
+    const int i4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    const int j  = blockIdx.y;
+    if (i4 >= M || j >= N) {
+        return;
+    }
+    const float cs  = col_scales[j];
+    const float4 rs = *(const float4 *) (row_scales + i4);
+    const int4   c  = *(const int4 *)   (src_i32 + (int64_t) j * M + i4);
+    float4 out;
+    out.x = (float) c.x * (rs.x * cs);
+    out.y = (float) c.y * (rs.y * cs);
+    out.z = (float) c.z * (rs.z * cs);
+    out.w = (float) c.w * (rs.w * cs);
+    if (add_src) {
+        const float4 a = *(const float4 *) (add_src + (int64_t) j * s_dst + i4);
+        out.x += a.x;
+        out.y += a.y;
+        out.z += a.z;
+        out.w += a.w;
+    }
+    *(float4 *) (dst + (int64_t) j * s_dst + i4) = out;
+}
+
+__global__ static void dequant_i32_swiglu_epilogue_kernel(
+        const int32_t * __restrict__ gate_i32, const float * __restrict__ gate_rs,
+        const int32_t * __restrict__ up_i32,   const float * __restrict__ up_rs,
+        const float * __restrict__ col_scales, float * __restrict__ dst,
+        const int M, const int N, const int64_t s_dst) {
+    const int i4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    const int j  = blockIdx.y;
+    if (i4 >= M || j >= N) {
+        return;
+    }
+    const float cs   = col_scales[j];
+    const float4 grs = *(const float4 *) (gate_rs + i4);
+    const float4 urs = *(const float4 *) (up_rs   + i4);
+    const int4   gc  = *(const int4 *)   (gate_i32 + (int64_t) j * M + i4);
+    const int4   uc  = *(const int4 *)   (up_i32   + (int64_t) j * M + i4);
+    auto silu = [](float x) { return x / (1.0f + __expf(-x)); };
+    float4 out;
+    out.x = silu((float) gc.x * (grs.x * cs)) * ((float) uc.x * (urs.x * cs));
+    out.y = silu((float) gc.y * (grs.y * cs)) * ((float) uc.y * (urs.y * cs));
+    out.z = silu((float) gc.z * (grs.z * cs)) * ((float) uc.z * (urs.z * cs));
+    out.w = silu((float) gc.w * (grs.w * cs)) * ((float) uc.w * (urs.w * cs));
+    *(float4 *) (dst + (int64_t) j * s_dst + i4) = out;
+}
+
+// Fused SwiGLU + col-wise INT8 quantization directly into B_i8 cache (zero 142 MB F32 intermediate!).
+// 1 CTA per column j, 512 threads, up to M <= 18432 (512 * 4 * 9) held 100% in registers.
+__global__ static void dequant_i32_swiglu_to_i8_epilogue_kernel(
+        const int32_t * __restrict__ gate_i32, const float * __restrict__ gate_rs,
+        const int32_t * __restrict__ up_i32,   const float * __restrict__ up_rs,
+        const float * __restrict__ in_col_scales,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int M4 = M >> 2;
+    const float cs = in_col_scales[j];
+    const int4 * g4 = (const int4 *) (gate_i32 + (int64_t) j * M);
+    const int4 * u4 = (const int4 *) (up_i32   + (int64_t) j * M);
+    const float4 * grs4 = (const float4 *) gate_rs;
+    const float4 * urs4 = (const float4 *) up_rs;
+
+    constexpr int MAX_REG = 9;
+    float4 reg[MAX_REG];
+    auto silu = [](float x) { return x / (1.0f + __expf(-x)); };
+    float cmax = 0.0f;
+#pragma unroll
+    for (int r = 0; r < MAX_REG; ++r) {
+        const int i = r * 512 + tid;
+        if (i < M4) {
+            const float4 grs = grs4[i];
+            const float4 urs = urs4[i];
+            const int4   gc  = g4[i];
+            const int4   uc  = u4[i];
+            float4 y;
+            y.x = silu((float) gc.x * (grs.x * cs)) * ((float) uc.x * (urs.x * cs));
+            y.y = silu((float) gc.y * (grs.y * cs)) * ((float) uc.y * (urs.y * cs));
+            y.z = silu((float) gc.z * (grs.z * cs)) * ((float) uc.z * (urs.z * cs));
+            y.w = silu((float) gc.w * (grs.w * cs)) * ((float) uc.w * (urs.w * cs));
+            reg[r] = y;
+            cmax = fmaxf(cmax, fabsf(y.x));
+            cmax = fmaxf(cmax, fabsf(y.y));
+            cmax = fmaxf(cmax, fabsf(y.z));
+            cmax = fmaxf(cmax, fabsf(y.w));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    __shared__ float smax[16];
+    if ((tid & 31) == 0) {
+        smax[tid >> 5] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = smax[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float scale_col = max_v / 127.0f;
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = scale_col;
+    }
+
+    char4 * out4 = (char4 *) (dst_i8 + (int64_t) j * M);
+#pragma unroll
+    for (int r = 0; r < MAX_REG; ++r) {
+        const int i = r * 512 + tid;
+        if (i < M4) {
+            const float4 y = reg[r];
+            char4 q;
+            q.x = (int8_t) __float2int_rn(y.x * inv_scale);
+            q.y = (int8_t) __float2int_rn(y.y * inv_scale);
+            q.z = (int8_t) __float2int_rn(y.z * inv_scale);
+            q.w = (int8_t) __float2int_rn(y.w * inv_scale);
+            out4[i] = q;
+        }
+    }
+}
+
+// Fused SwiGLU + MUL(Hadamard signs) + FWHT(H) + col-wise INT8 quantization directly into B_i8 cache!
+// Eliminates 142.6 MB SwiGLU F32 write + 142.6 MB MUL/FWHT read+write + 142.6 MB quantize read per layer!
+template <int H>
+__global__ static void dequant_i32_swiglu_fwht_to_i8_kernel(
+        const int32_t * __restrict__ gate_i32, const float * __restrict__ gate_rs,
+        const int32_t * __restrict__ up_i32,   const float * __restrict__ up_rs,
+        const float * __restrict__ in_col_scales,
+        const float * __restrict__ signs,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid = threadIdx.x; // 0 .. H-1
+    const int n_blk = M / H;
+    const float cs = in_col_scales[j];
+    const int32_t * gc_col = gate_i32 + (int64_t) j * M;
+    const int32_t * uc_col = up_i32   + (int64_t) j * M;
+
+    __shared__ float s[H];
+    constexpr int MAX_BLK = 36; // supports M <= 36 * 512 = 18432
+    float reg[MAX_BLK];
+    auto silu = [](float x) { return x / (1.0f + __expf(-x)); };
+    float cmax = 0.0f;
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int idx = b * H + tid;
+        float v = silu((float) gc_col[idx] * (gate_rs[idx] * cs)) *
+                  ((float) uc_col[idx] * (up_rs[idx] * cs)) * signs[idx];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float v2 = __shfl_xor_sync(0xFFFFFFFF, v, h);
+            v = ((tid & h) == 0) ? (v + v2) : (v2 - v);
+        }
+#pragma unroll
+        for (int h = 32; h < H; h <<= 1) {
+            s[tid] = v;
+            __syncthreads();
+            const float v2 = s[tid ^ h];
+            v = ((tid & h) == 0) ? (v + v2) : (v2 - v);
+            __syncthreads();
+        }
+        reg[b] = v;
+        cmax = fmaxf(cmax, fabsf(v));
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    __shared__ float smax[16];
+    constexpr int nwarps = H / 32;
+    if ((tid & 31) == 0) {
+        smax[tid >> 5] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = (tid < nwarps) ? smax[tid] : 0.0f;
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float fwht_scale = rsqrtf((float) H);
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = (max_v / 127.0f) * fwht_scale;
+    }
+
+    int8_t * out_col = dst_i8 + (int64_t) j * M;
+    for (int b = 0; b < n_blk; ++b) {
+        out_col[b * H + tid] = (int8_t) __float2int_rn(reg[b] * inv_scale);
+    }
+}
+
+// Lossless warp-parallel ZERO-SMEM-TRANSPOSE GDN build_norm_gated (+ 4D head permute) + FWHT(1024) -> B_i8!
+template <int N_BLK, bool TO_S4 = false>
+__global__ static void gdn_norm_gated_fwht1024_to_i8_kernel(
+        const float * __restrict__ src,
+        const float * __restrict__ rms_w,
+        const float eps,
+        const float * __restrict__ z_gate,
+        const float * __restrict__ signs,
+        int8_t * __restrict__ dst_i8,
+        float * __restrict__ out_col_scales,
+        const int N, const int N_pad, const int perm_nk, const int perm_rep, const float clip_sigma = 0.0f) {
+    constexpr int M = N_BLK * 1024;
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid  = threadIdx.x; // 0 .. N_BLK*32-1
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    uint32_t * out32 = TO_S4 ? ((uint32_t *) dst_i8 + (int64_t) j * (M >> 3))
+                             : ((uint32_t *) (dst_i8 + (int64_t) j * M));
+    if (j >= N) {
+        if (tid == 0) { out_col_scales[j] = 0.0f; }
+        const int n_w = TO_S4 ? (M >> 3) : (M >> 2);
+        for (int i = tid; i < n_w; i += N_BLK * 32) { out32[i] = 0u; }
+        return;
+    }
+    const float * s_col = src    + (int64_t) j * M;
+    const float * z_col = z_gate + (int64_t) j * M;
+    const int n_heads_blk = 8; // 1024 / 128 = 8 heads per warp
+    float v[32];
+    const int h_base = warp * n_heads_blk;
+#pragma unroll
+    for (int h = 0; h < n_heads_blk; ++h) {
+        const int out_h = h_base + h;
+        const int in_h  = (perm_rep > 1) ? ((out_h % perm_rep) * perm_nk + (out_h / perm_rep)) : out_h;
+        const int in_base  = in_h  * 128;
+        const int out_base = out_h * 128;
+        float x0 = s_col[in_base + lane +  0];
+        float x1 = s_col[in_base + lane + 32];
+        float x2 = s_col[in_base + lane + 64];
+        float x3 = s_col[in_base + lane + 96];
+        float ssq = x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { ssq += __shfl_xor_sync(0xFFFFFFFF, ssq, off); }
+        const float irms = rsqrtf(ssq * (1.0f / 128.0f) + eps);
+        const float g0 = z_col[in_base + lane +  0];
+        const float g1 = z_col[in_base + lane + 32];
+        const float g2 = z_col[in_base + lane + 64];
+        const float g3 = z_col[in_base + lane + 96];
+        v[h * 4 + 0] = (x0 * irms * rms_w[lane +  0]) * (g0 / (1.0f + __expf(-g0))) * signs[out_base + lane +  0];
+        v[h * 4 + 1] = (x1 * irms * rms_w[lane + 32]) * (g1 / (1.0f + __expf(-g1))) * signs[out_base + lane + 32];
+        v[h * 4 + 2] = (x2 * irms * rms_w[lane + 64]) * (g2 / (1.0f + __expf(-g2))) * signs[out_base + lane + 64];
+        v[h * 4 + 3] = (x3 * irms * rms_w[lane + 96]) * (g3 / (1.0f + __expf(-g3))) * signs[out_base + lane + 96];
+    }
+    // 2D FWHT(1024) = H_32(in-reg) kron H_32(warp-shfl), zero smem!
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1)) {
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+        }
+    }
+    float cmax = 0.0f, csq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+        cmax = fmaxf(cmax, fabsf(x));
+        if constexpr (TO_S4) { csq += x * x; }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+        if constexpr (TO_S4) { csq += __shfl_xor_sync(0xFFFFFFFF, csq, off); }
+    }
+    __shared__ float smax[N_BLK], ssq_sh[N_BLK];
+    if (lane == 0) { smax[warp] = cmax; if constexpr (TO_S4) { ssq_sh[warp] = csq; } }
+    __syncthreads();
+    float max_v = 0.0f, tot_sq = 0.0f;
+#pragma unroll
+    for (int w = 0; w < N_BLK; ++w) { max_v = fmaxf(max_v, smax[w]); if constexpr (TO_S4) { tot_sq += ssq_sh[w]; } }
+    if constexpr (TO_S4) {
+        const float rms = sqrtf(tot_sq / (float) M);
+        const float c   = (clip_sigma > 0.0f) ? fminf(max_v, clip_sigma * rms) : max_v;
+        const float inv_scale = c > 0.0f ? (7.0f / c) : 0.0f;
+        if (tid == 0) { out_col_scales[j] = (c * (1.0f / 7.0f)) * (1.0f / 32.0f); }
+        uint32_t * out_blk = out32 + warp * 128;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            uint32_t q = (uint32_t)(max(-8, min(7, __float2int_rn(v[k] * inv_scale))) & 0xF);
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 4;
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 8;
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 4) << 16;
+            if ((lane & 7) == 0) { out_blk[k * 4 + (lane >> 3)] = q; }
+        }
+    } else {
+        const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+        if (tid == 0) { out_col_scales[j] = (max_v / 127.0f) * (1.0f / 32.0f); }
+        uint32_t * out_blk = out32 + warp * 256;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            uint32_t q = (uint32_t)(uint8_t)(int8_t) __float2int_rn(v[k] * inv_scale);
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 8;
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 16;
+            if ((lane & 3) == 0) { out_blk[k * 8 + (lane >> 2)] = q; }
+        }
+    }
+}
+
+// Lossless warp-parallel ZERO-SMEM-TRANSPOSE Full-Attn Gate: SIGMOID(gate) * attn_out * signs + FWHT(1024) -> B_i8 / B_s4!
+template <int N_BLK, bool TO_S4 = false>
+__global__ static void sigmoid_mul_fwht1024_to_i8_kernel(
+        const float * __restrict__ attn_out,
+        const float * __restrict__ gate,
+        const float * __restrict__ signs,
+        int8_t * __restrict__ dst_i8,
+        float * __restrict__ out_col_scales,
+        const int N, const int N_pad, const bool strided_gate, const float clip_sigma = 0.0f) {
+    constexpr int M = N_BLK * 1024;
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    uint32_t * out32 = TO_S4 ? ((uint32_t *) dst_i8 + (int64_t) j * (M >> 3))
+                             : ((uint32_t *) (dst_i8 + (int64_t) j * M));
+    if (j >= N) {
+        if (tid == 0) { out_col_scales[j] = 0.0f; }
+        const int n_w = TO_S4 ? (M >> 3) : (M >> 2);
+        for (int i = tid; i < n_w; i += N_BLK * 32) { out32[i] = 0u; }
+        return;
+    }
+    const float * a_col = attn_out + (int64_t) j * M;
+    const float * g_col = strided_gate ? (gate + (int64_t) j * (M * 2)) : (gate + (int64_t) j * M);
+    float v[32];
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const int idx = warp * 1024 + k * 32 + lane;
+        const int g_idx = strided_gate ? (((idx >> 8) * 512) + 256 + (idx & 255)) : idx;
+        const float gv = g_col[g_idx];
+        v[k] = a_col[idx] * (1.0f / (1.0f + __expf(-gv))) * signs[idx];
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1)) {
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+        }
+    }
+    float cmax = 0.0f, csq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+        cmax = fmaxf(cmax, fabsf(x));
+        if constexpr (TO_S4) { csq += x * x; }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+        if constexpr (TO_S4) { csq += __shfl_xor_sync(0xFFFFFFFF, csq, off); }
+    }
+    __shared__ float smax[N_BLK], ssq_sh[N_BLK];
+    if (lane == 0) { smax[warp] = cmax; if constexpr (TO_S4) { ssq_sh[warp] = csq; } }
+    __syncthreads();
+    float max_v = 0.0f, tot_sq = 0.0f;
+#pragma unroll
+    for (int w = 0; w < N_BLK; ++w) { max_v = fmaxf(max_v, smax[w]); if constexpr (TO_S4) { tot_sq += ssq_sh[w]; } }
+    if constexpr (TO_S4) {
+        const float rms = sqrtf(tot_sq / (float) M);
+        const float c   = (clip_sigma > 0.0f) ? fminf(max_v, clip_sigma * rms) : max_v;
+        const float inv_scale = c > 0.0f ? (7.0f / c) : 0.0f;
+        if (tid == 0) { out_col_scales[j] = (c * (1.0f / 7.0f)) * (1.0f / 32.0f); }
+        uint32_t * out_blk = out32 + warp * 128;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            uint32_t q = (uint32_t)(max(-8, min(7, __float2int_rn(v[k] * inv_scale))) & 0xF);
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 4;
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 8;
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 4) << 16;
+            if ((lane & 7) == 0) { out_blk[k * 4 + (lane >> 3)] = q; }
+        }
+    } else {
+        const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+        if (tid == 0) { out_col_scales[j] = (max_v / 127.0f) * (1.0f / 32.0f); }
+        uint32_t * out_blk = out32 + warp * 256;
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            uint32_t q = (uint32_t)(uint8_t)(int8_t) __float2int_rn(v[k] * inv_scale);
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 1) << 8;
+            q |= __shfl_down_sync(0xFFFFFFFF, q, 2) << 16;
+            if ((lane & 3) == 0) { out_blk[k * 8 + (lane >> 2)] = q; }
+        }
+    }
+}
+
+static thread_local std::unordered_map<const ggml_tensor *, const ggml_tensor *> tl_skipped_gate_cont_i8;
+
+template <int N_BLK>
+__global__ static void gdn_norm_gated_fwht1024_to_narrow_i8_kernel(
+        const float * __restrict__ src, const float * __restrict__ rms_w, const float eps,
+        const float * __restrict__ z_gate, const float * __restrict__ signs,
+        uint32_t * __restrict__ dst_i8, int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
+        const int N, const int N_pad, const int perm_nk, const int perm_rep) {
+    constexpr int M = N_BLK * 1024;
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int K4 = M >> 2, n_kblk = M >> 7;
+    uint32_t * out32  = dst_i8        + (int64_t) j * K4;
+    int32_t  * out_s  = dst_sum128    + (int64_t) j * n_kblk;
+    float    * out_sc = dst_scales128 + (int64_t) j * n_kblk;
+    if (j >= N) {
+        for (int i = tid; i < K4; i += N_BLK * 32) { out32[i] = 0u; }
+        for (int i = tid; i < n_kblk; i += N_BLK * 32) { out_s[i] = 0; out_sc[i] = 0.0f; }
+        return;
+    }
+    const float * s_col = src    + (int64_t) j * M;
+    const float * z_col = z_gate + (int64_t) j * M;
+    float v[32];
+    const int h_base = warp * 8;
+#pragma unroll
+    for (int h = 0; h < 8; ++h) {
+        const int out_h = h_base + h;
+        const int in_h  = (perm_rep > 1) ? ((out_h % perm_rep) * perm_nk + (out_h / perm_rep)) : out_h;
+        const int in_base = in_h * 128, out_base = out_h * 128;
+        const float x0 = s_col[in_base + lane +  0], x1 = s_col[in_base + lane + 32];
+        const float x2 = s_col[in_base + lane + 64], x3 = s_col[in_base + lane + 96];
+        float ssq = x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { ssq += __shfl_xor_sync(0xFFFFFFFF, ssq, off); }
+        const float irms = rsqrtf(ssq * (1.0f / 128.0f) + eps);
+        const float g0 = z_col[in_base + lane +  0], g1 = z_col[in_base + lane + 32];
+        const float g2 = z_col[in_base + lane + 64], g3 = z_col[in_base + lane + 96];
+        v[h * 4 + 0] = (x0 * irms * rms_w[lane +  0]) * __fdividef(g0, 1.0f + __expf(-g0)) * signs[out_base + lane +  0];
+        v[h * 4 + 1] = (x1 * irms * rms_w[lane + 32]) * __fdividef(g1, 1.0f + __expf(-g1)) * signs[out_base + lane + 32];
+        v[h * 4 + 2] = (x2 * irms * rms_w[lane + 64]) * __fdividef(g2, 1.0f + __expf(-g2)) * signs[out_base + lane + 64];
+        v[h * 4 + 3] = (x3 * irms * rms_w[lane + 96]) * __fdividef(g3, 1.0f + __expf(-g3)) * signs[out_base + lane + 96];
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1)
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1))
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+    }
+    fwht1024_pack_2nibble_warp(v, warp, lane, out32, out_s, out_sc);
+}
+
+static bool ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * rms_w, float eps,
+        const ggml_tensor * z_gate, const ggml_tensor * signs, const ggml_tensor * fwht_out,
+        int64_t M, int64_t N, int perm_nk, int perm_rep) {
+    if (M != 6144 && M != 4096) { return false; }
+    cudaStream_t stream = ctx.stream();
+    if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n()) {
+        auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+        const int64_t N_pad = pq2_narrow_i8_n_pad(N);
+        if (!pq2_narrow_i8_alloc_bufs(sc, N_pad, M, stream)) { return false; }
+        if (M == 6144) {
+            gdn_norm_gated_fwht1024_to_narrow_i8_kernel<6><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
+                (const float *) src->data, (const float *) rms_w->data, eps,
+                (const float *) z_gate->data, (const float *) signs->data,
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+        } else {
+            gdn_norm_gated_fwht1024_to_narrow_i8_kernel<4><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
+                (const float *) src->data, (const float *) rms_w->data, eps,
+                (const float *) z_gate->data, (const float *) signs->data,
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+        }
+        sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
+        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256) {
+        auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+        const int64_t N_pad = ((N + 127) / 128) * 128;
+        const size_t need_b = (size_t) N_pad * (size_t) (M >> 3) * sizeof(uint32_t);
+        const size_t need_s = (size_t) N_pad * sizeof(float);
+        if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+        if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+        const float clip = ggml_cuda_pq2_prefill_int4_clip();
+        if (M == 6144) {
+            gdn_norm_gated_fwht1024_to_i8_kernel<6, true><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
+                (const float *) src->data, (const float *) rms_w->data, eps,
+                (const float *) z_gate->data, (const float *) signs->data,
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, clip);
+        } else {
+            gdn_norm_gated_fwht1024_to_i8_kernel<4, true><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
+                (const float *) src->data, (const float *) rms_w->data, eps,
+                (const float *) z_gate->data, (const float *) signs->data,
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, clip);
+        }
+        sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
+        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (!ggml_cuda_pq2_cublas_i8_enabled() || !pq2_b_i8_cache_enabled() || N < 129) { return false; }
+    auto & st = pq2_b_i8_cache_for_stream(stream);
+    const int64_t N_pad = (N + 3) & ~int64_t(3);
+    const size_t need_b = (size_t) N_pad * (size_t) M;
+    const size_t need_s = (size_t) N_pad * sizeof(float);
+    if (st.B_i8_cap < need_b) { if (st.B_i8) CUDA_CHECK(cudaFree(st.B_i8)); CUDA_CHECK(cudaMalloc(&st.B_i8, need_b)); st.B_i8_cap = need_b; }
+    if (st.col_scales_cap < need_s) { if (st.col_scales) CUDA_CHECK(cudaFree(st.col_scales)); CUDA_CHECK(cudaMalloc(&st.col_scales, need_s)); st.col_scales_cap = need_s; }
+    if (M == 6144) {
+        gdn_norm_gated_fwht1024_to_i8_kernel<6, false><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
+            (const float *) src->data, (const float *) rms_w->data, eps,
+            (const float *) z_gate->data, (const float *) signs->data,
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+    } else {
+        gdn_norm_gated_fwht1024_to_i8_kernel<4, false><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
+            (const float *) src->data, (const float *) rms_w->data, eps,
+            (const float *) z_gate->data, (const float *) signs->data,
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+    }
+    st.src1_data = fwht_out->data; st.src1_nbytes = ggml_nbytes(fwht_out);
+    st.N = N; st.K = M; st.s11 = M; st.valid = true;
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <int N_BLK>
+__global__ static void sigmoid_mul_fwht1024_to_narrow_i8_kernel(
+        const float * __restrict__ attn_out, const float * __restrict__ gate, const float * __restrict__ signs,
+        uint32_t * __restrict__ dst_i8, int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
+        const int N, const int N_pad, const bool strided_gate) {
+    constexpr int M = N_BLK * 1024;
+    const int j = blockIdx.x;
+    if (j >= N_pad) { return; }
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int K4 = M >> 2, n_kblk = M >> 7;
+    uint32_t * out32  = dst_i8        + (int64_t) j * K4;
+    int32_t  * out_s  = dst_sum128    + (int64_t) j * n_kblk;
+    float    * out_sc = dst_scales128 + (int64_t) j * n_kblk;
+    if (j >= N) {
+        for (int i = tid; i < K4; i += N_BLK * 32) { out32[i] = 0u; }
+        for (int i = tid; i < n_kblk; i += N_BLK * 32) { out_s[i] = 0; out_sc[i] = 0.0f; }
+        return;
+    }
+    const float * a_col = attn_out + (int64_t) j * M;
+    const float * g_col = gate     + (int64_t) j * (strided_gate ? (2 * M) : M);
+    float v[32];
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        const int idx = warp * 1024 + k * 32 + lane;
+        const int g_idx = strided_gate ? ((idx >> 8) * 512 + 256 + (idx & 255)) : idx;
+        const float g = g_col[g_idx];
+        v[k] = a_col[idx] * __fdividef(1.0f, 1.0f + __expf(-g)) * __ldg(signs + idx);
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1)
+#pragma unroll
+        for (int k = 0; k < 32; k += (h << 1))
+#pragma unroll
+            for (int r = 0; r < h; ++r) {
+                const float a = v[k + r], b = v[k + r + h];
+                v[k + r] = a + b; v[k + r + h] = a - b;
+            }
+#pragma unroll
+    for (int k = 0; k < 32; ++k) {
+        float x = v[k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float x2 = __shfl_xor_sync(0xFFFFFFFF, x, h);
+            x = ((lane & h) == 0) ? (x + x2) : (x2 - x);
+        }
+        v[k] = x;
+    }
+    fwht1024_pack_2nibble_warp(v, warp, lane, out32, out_s, out_sc);
+}
+
+static bool ggml_cuda_sigmoid_mul_fwht1024_to_i8(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * attn_out, const ggml_tensor * gate,
+        const ggml_tensor * signs, const ggml_tensor * fwht_out, int64_t M, int64_t N, bool strided_gate) {
+    if (M != 6144 && M != 4096) { return false; }
+    cudaStream_t stream = ctx.stream();
+    if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n()) {
+        auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+        const int64_t N_pad = pq2_narrow_i8_n_pad(N);
+        if (!pq2_narrow_i8_alloc_bufs(sc, N_pad, M, stream)) { return false; }
+        if (M == 6144) {
+            sigmoid_mul_fwht1024_to_narrow_i8_kernel<6><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
+                (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, strided_gate);
+        } else {
+            sigmoid_mul_fwht1024_to_narrow_i8_kernel<4><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
+                (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, strided_gate);
+        }
+        sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
+        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256) {
+        auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+        const int64_t N_pad = ((N + 127) / 128) * 128;
+        const size_t need_b = (size_t) N_pad * (size_t) (M >> 3) * sizeof(uint32_t);
+        const size_t need_s = (size_t) N_pad * sizeof(float);
+        if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+        if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+        const float clip = ggml_cuda_pq2_prefill_int4_clip();
+        if (M == 6144) {
+            sigmoid_mul_fwht1024_to_i8_kernel<6, true><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
+                (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, strided_gate, clip);
+        } else {
+            sigmoid_mul_fwht1024_to_i8_kernel<4, true><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
+                (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, strided_gate, clip);
+        }
+        sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
+        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (!ggml_cuda_pq2_cublas_i8_enabled() || !pq2_b_i8_cache_enabled() || N < 129) { return false; }
+    auto & st = pq2_b_i8_cache_for_stream(stream);
+    const int64_t N_pad = (N + 3) & ~int64_t(3);
+    const size_t need_b = (size_t) N_pad * (size_t) M;
+    const size_t need_s = (size_t) N_pad * sizeof(float);
+    if (st.B_i8_cap < need_b) { if (st.B_i8) CUDA_CHECK(cudaFree(st.B_i8)); CUDA_CHECK(cudaMalloc(&st.B_i8, need_b)); st.B_i8_cap = need_b; }
+    if (st.col_scales_cap < need_s) { if (st.col_scales) CUDA_CHECK(cudaFree(st.col_scales)); CUDA_CHECK(cudaMalloc(&st.col_scales, need_s)); st.col_scales_cap = need_s; }
+    if (M == 6144) {
+        sigmoid_mul_fwht1024_to_i8_kernel<6, false><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
+            (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, strided_gate);
+    } else {
+        sigmoid_mul_fwht1024_to_i8_kernel<4, false><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
+            (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, strided_gate);
+    }
+    st.src1_data = fwht_out->data; st.src1_nbytes = ggml_nbytes(fwht_out);
+    st.N = N; st.K = M; st.s11 = M; st.valid = true;
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// Fused MUL(Hadamard signs) + FWHT(H) + col-wise INT8 quantization directly into B_i8 cache!
+template <int H>
+__global__ static void mul_signs_fwht_to_i8_kernel(
+        const float * __restrict__ src, const float * __restrict__ signs,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N, const int64_t s11) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid = threadIdx.x; // 0 .. H-1
+    const int n_blk = M / H;
+    const float * in_col = src + (int64_t) j * s11;
+
+    __shared__ float s[H];
+    constexpr int MAX_BLK = 36;
+    float reg[MAX_BLK];
+    float cmax = 0.0f;
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int idx = b * H + tid;
+        float v = in_col[idx] * signs[idx];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float v2 = __shfl_xor_sync(0xFFFFFFFF, v, h);
+            v = ((tid & h) == 0) ? (v + v2) : (v2 - v);
+        }
+#pragma unroll
+        for (int h = 32; h < H; h <<= 1) {
+            s[tid] = v;
+            __syncthreads();
+            const float v2 = s[tid ^ h];
+            v = ((tid & h) == 0) ? (v + v2) : (v2 - v);
+            __syncthreads();
+        }
+        reg[b] = v;
+        cmax = fmaxf(cmax, fabsf(v));
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    __shared__ float smax[16];
+    constexpr int nwarps = H / 32;
+    if ((tid & 31) == 0) {
+        smax[tid >> 5] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = (tid < nwarps) ? smax[tid] : 0.0f;
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float fwht_scale = rsqrtf((float) H);
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = (max_v / 127.0f) * fwht_scale;
+    }
+
+    int8_t * out_col = dst_i8 + (int64_t) j * M;
+    for (int b = 0; b < n_blk; ++b) {
+        out_col[b * H + tid] = (int8_t) __float2int_rn(reg[b] * inv_scale);
+    }
+}
+
+// H=1024 specialization using H_1024 = H_32 kron H_32 (512 threads = 16 warps, 2 elems/thread):
+// Only 1 __syncthreads() per 1024-block in the main loop (transposed registers),
+// and coalesced 32-bit STG.32 (int32_t / 4x int8_t) stores at the end!
+__global__ static void dequant_i32_swiglu_fwht1024_to_i8_kernel(
+        const int32_t * __restrict__ gate_i32, const float * __restrict__ gate_rs,
+        const int32_t * __restrict__ up_i32,   const float * __restrict__ up_rs,
+        const float * __restrict__ in_col_scales,
+        const float * __restrict__ signs,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid  = threadIdx.x; // 0 .. 511
+    const int warp = tid >> 5;    // 0 .. 15
+    const int lane = tid & 31;    // 0 .. 31
+    const int n_blk = M >> 10;    // M / 1024
+    const float cs = in_col_scales[j];
+    const int32_t * gc_col = gate_i32 + (int64_t) j * M;
+    const int32_t * uc_col = up_i32   + (int64_t) j * M;
+
+    __shared__ float s[32][33];
+    constexpr int MAX_BLK = 18; // supports M <= 18432
+    float reg0[MAX_BLK];
+    float reg1[MAX_BLK];
+    auto silu = [](float x) { return x / (1.0f + __expf(-x)); };
+    float cmax = 0.0f;
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int i0 = b * 1024 + tid;
+        const int i1 = i0 + 512;
+        float v0 = silu((float) gc_col[i0] * (gate_rs[i0] * cs)) *
+                   ((float) uc_col[i0] * (up_rs[i0] * cs)) * signs[i0];
+        float v1 = silu((float) gc_col[i1] * (gate_rs[i1] * cs)) *
+                   ((float) uc_col[i1] * (up_rs[i1] * cs)) * signs[i1];
+        // Stage 1: H_32 along columns (lane = 0..31)
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float a2 = __shfl_xor_sync(0xFFFFFFFF, v0, h);
+            const float b2 = __shfl_xor_sync(0xFFFFFFFF, v1, h);
+            v0 = ((lane & h) == 0) ? (v0 + a2) : (a2 - v0);
+            v1 = ((lane & h) == 0) ? (v1 + b2) : (b2 - v1);
+        }
+        // Transpose into s[col][row]
+        s[lane][warp]      = v0;
+        s[lane][warp + 16] = v1;
+        __syncthreads();
+        // Stage 2: H_32 along rows (lane = row 0..31, warp/warp+16 = col)
+        float u0 = s[warp][lane];
+        float u1 = s[warp + 16][lane];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float a2 = __shfl_xor_sync(0xFFFFFFFF, u0, h);
+            const float b2 = __shfl_xor_sync(0xFFFFFFFF, u1, h);
+            u0 = ((lane & h) == 0) ? (u0 + a2) : (a2 - u0);
+            u1 = ((lane & h) == 0) ? (u1 + b2) : (b2 - u1);
+        }
+        reg0[b] = u0;
+        reg1[b] = u1;
+        cmax = fmaxf(cmax, fmaxf(fabsf(u0), fabsf(u1)));
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    __shared__ float smax[16];
+    if (lane == 0) {
+        smax[warp] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = smax[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float fwht_scale = 1.0f / 32.0f; // 1 / sqrt(1024)
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = (max_v / 127.0f) * fwht_scale;
+    }
+
+    // Transpose quantized int8_t back via s_i8[32][36] and write coalesced 32-bit char4 (STG.32)!
+    int8_t * s_i8 = (int8_t *) s; // 32 * 36 = 1152 bytes <= 4224 bytes of s!
+    int32_t * out32 = (int32_t *) (dst_i8 + (int64_t) j * M);
+    for (int b = 0; b < n_blk; ++b) {
+        s_i8[lane * 36 + warp]      = (int8_t) __float2int_rn(reg0[b] * inv_scale);
+        s_i8[lane * 36 + warp + 16] = (int8_t) __float2int_rn(reg1[b] * inv_scale);
+        __syncthreads();
+        if (tid < 256) {
+            const int r = tid >> 3;      // 0..31
+            const int c4 = (tid & 7) * 4; // 0, 4, ..., 28
+            out32[b * 256 + tid] = *(const int32_t *) (s_i8 + r * 36 + c4);
+        }
+        __syncthreads();
+    }
+}
+
+// 7-op super-fusion: dequant_i32 + ADD(residual) + RMS_NORM + MUL(rms_weight) [+ MUL(hadamard_signs) + FWHT(1024)] -> B_i8 cache!
+// 1 CTA per column j, 512 threads, M=5120 (5 blocks of 1024 -> 10 floats/thread in registers!).
+__global__ static void dequant_i32_add_rms_mul_fwht1024_to_i8_kernel(
+        const int32_t * __restrict__ src_i32, const float * __restrict__ row_scales, const float * __restrict__ in_col_scales,
+        const float * __restrict__ add_src, float * __restrict__ add_dst,
+        const float * __restrict__ rms_weight, const float eps,
+        const float * __restrict__ hadamard_signs,
+        float * __restrict__ norm_f32_dst,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N, const int64_t s_dst) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid  = threadIdx.x; // 0..511
+    const int warp = tid >> 5;    // 0..15
+    const int lane = tid & 31;    // 0..31
+    const int n_blk = M >> 10;    // M / 1024 (e.g. 5 for 5120)
+    const float cs = in_col_scales[j];
+    const int32_t * c_col  = src_i32 + (int64_t) j * M;
+    const float   * a_col  = add_src + (int64_t) j * s_dst;
+    float         * ad_col = add_dst + (int64_t) j * s_dst;
+
+    constexpr int MAX_BLK = 8; // supports M <= 8192
+    float reg0[MAX_BLK];
+    float reg1[MAX_BLK];
+    float sum_sq = 0.0f;
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int i0 = b * 1024 + tid;
+        const int i1 = i0 + 512;
+        const float v0 = (float) c_col[i0] * (row_scales[i0] * cs) + a_col[i0];
+        const float v1 = (float) c_col[i1] * (row_scales[i1] * cs) + a_col[i1];
+        ad_col[i0] = v0;
+        ad_col[i1] = v1;
+        reg0[b] = v0;
+        reg1[b] = v1;
+        sum_sq += v0 * v0 + v1 * v1;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, off);
+    }
+    __shared__ float sbuf[16];
+    if (lane == 0) {
+        sbuf[warp] = sum_sq;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = sbuf[tid];
+        v += __shfl_xor_sync(0xFFFF, v, 8);
+        v += __shfl_xor_sync(0xFFFF, v, 4);
+        v += __shfl_xor_sync(0xFFFF, v, 2);
+        v += __shfl_xor_sync(0xFFFF, v, 1);
+        sbuf[0] = v;
+    }
+    __syncthreads();
+    const float inv_rms = rsqrtf(sbuf[0] / (float) M + eps);
+
+    __shared__ float s[32][33];
+    float cmax = 0.0f;
+    for (int b = 0; b < n_blk; ++b) {
+        const int i0 = b * 1024 + tid;
+        const int i1 = i0 + 512;
+        float v0 = reg0[b] * inv_rms * rms_weight[i0];
+        float v1 = reg1[b] * inv_rms * rms_weight[i1];
+        if (norm_f32_dst) {
+            norm_f32_dst[(int64_t) j * s_dst + i0] = v0;
+            norm_f32_dst[(int64_t) j * s_dst + i1] = v1;
+        }
+        v0 *= hadamard_signs[i0];
+        v1 *= hadamard_signs[i1];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float a2 = __shfl_xor_sync(0xFFFFFFFF, v0, h);
+            const float b2 = __shfl_xor_sync(0xFFFFFFFF, v1, h);
+            v0 = ((lane & h) == 0) ? (v0 + a2) : (a2 - v0);
+            v1 = ((lane & h) == 0) ? (v1 + b2) : (b2 - v1);
+        }
+        s[lane][warp]      = v0;
+        s[lane][warp + 16] = v1;
+        __syncthreads();
+        float u0 = s[warp][lane];
+        float u1 = s[warp + 16][lane];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float a2 = __shfl_xor_sync(0xFFFFFFFF, u0, h);
+            const float b2 = __shfl_xor_sync(0xFFFFFFFF, u1, h);
+            u0 = ((lane & h) == 0) ? (u0 + a2) : (a2 - u0);
+            u1 = ((lane & h) == 0) ? (u1 + b2) : (b2 - u1);
+        }
+        reg0[b] = u0;
+        reg1[b] = u1;
+        cmax = fmaxf(cmax, fmaxf(fabsf(u0), fabsf(u1)));
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    if (lane == 0) {
+        sbuf[warp] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = sbuf[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        sbuf[0] = v;
+    }
+    __syncthreads();
+    const float max_v = sbuf[0];
+    const float fwht_scale = 1.0f / 32.0f; // 1 / sqrt(1024)
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = (max_v / 127.0f) * fwht_scale;
+    }
+
+    int8_t * s_i8 = (int8_t *) s;
+    int32_t * out32 = (int32_t *) (dst_i8 + (int64_t) j * M);
+    for (int b = 0; b < n_blk; ++b) {
+        s_i8[lane * 36 + warp]      = (int8_t) __float2int_rn(reg0[b] * inv_scale);
+        s_i8[lane * 36 + warp + 16] = (int8_t) __float2int_rn(reg1[b] * inv_scale);
+        __syncthreads();
+        if (tid < 256) {
+            const int r = tid >> 3;
+            const int c4 = (tid & 7) * 4;
+            out32[b * 256 + tid] = *(const int32_t *) (s_i8 + r * 36 + c4);
+        }
+        __syncthreads();
+    }
+}
+
+// Fused dequant_i32 + ADD(residual) + RMS_NORM + MUL(weight) -> direct B_i8 cache!
+// 1 CTA per column j, 512 threads, M <= 512 * 4 * 4 = 8192 (M=5120 -> 3 float4s/thread in registers!).
+__global__ static void dequant_i32_add_rms_mul_to_i8_kernel(
+        const int32_t * __restrict__ src_i32, const float * __restrict__ row_scales, const float * __restrict__ in_col_scales,
+        const float * __restrict__ add_src, float * __restrict__ add_dst,
+        const float * __restrict__ rms_weight, const float eps,
+        float * __restrict__ norm_f32_dst,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N, const int64_t s_dst) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int M4 = M >> 2;
+    const float cs = in_col_scales[j];
+    const int4   * c4   = (const int4 *)   (src_i32 + (int64_t) j * M);
+    const float4 * rs4  = (const float4 *) row_scales;
+    const float4 * a4   = (const float4 *) (add_src + (int64_t) j * s_dst);
+    float4       * ad4  = (float4 *)       (add_dst + (int64_t) j * s_dst);
+    const float4 * w4   = (const float4 *) rms_weight;
+
+    constexpr int MAX_REG = 4; // 512 * 4 * 4 = 8192 floats
+    float4 reg[MAX_REG];
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int r = 0; r < MAX_REG; ++r) {
+        const int i = r * 512 + tid;
+        if (i < M4) {
+            const int4   c  = c4[i];
+            const float4 rs = rs4[i];
+            const float4 a  = a4[i];
+            float4 v;
+            v.x = (float) c.x * (rs.x * cs) + a.x;
+            v.y = (float) c.y * (rs.y * cs) + a.y;
+            v.z = (float) c.z * (rs.z * cs) + a.z;
+            v.w = (float) c.w * (rs.w * cs) + a.w;
+            ad4[i] = v;
+            reg[r] = v;
+            sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, off);
+    }
+    __shared__ float sbuf[16];
+    if ((tid & 31) == 0) {
+        sbuf[tid >> 5] = sum_sq;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = sbuf[tid];
+        v += __shfl_xor_sync(0xFFFF, v, 8);
+        v += __shfl_xor_sync(0xFFFF, v, 4);
+        v += __shfl_xor_sync(0xFFFF, v, 2);
+        v += __shfl_xor_sync(0xFFFF, v, 1);
+        sbuf[0] = v;
+    }
+    __syncthreads();
+    const float inv_rms = rsqrtf(sbuf[0] / (float) M + eps);
+
+    float cmax = 0.0f;
+#pragma unroll
+    for (int r = 0; r < MAX_REG; ++r) {
+        const int i = r * 512 + tid;
+        if (i < M4) {
+            const float4 w = w4[i];
+            float4 v = reg[r];
+            v.x = v.x * inv_rms * w.x;
+            v.y = v.y * inv_rms * w.y;
+            v.z = v.z * inv_rms * w.z;
+            v.w = v.w * inv_rms * w.w;
+            reg[r] = v;
+            if (norm_f32_dst) {
+                ((float4 *) (norm_f32_dst + (int64_t) j * s_dst))[i] = v;
+            }
+            cmax = fmaxf(cmax, fabsf(v.x));
+            cmax = fmaxf(cmax, fabsf(v.y));
+            cmax = fmaxf(cmax, fabsf(v.z));
+            cmax = fmaxf(cmax, fabsf(v.w));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    if ((tid & 31) == 0) {
+        sbuf[tid >> 5] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = sbuf[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        sbuf[0] = v;
+    }
+    __syncthreads();
+    const float max_v = sbuf[0];
+    const float scale_col = max_v / 127.0f;
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = scale_col;
+    }
+
+    char4 * out4 = (char4 *) (dst_i8 + (int64_t) j * M);
+#pragma unroll
+    for (int r = 0; r < MAX_REG; ++r) {
+        const int i = r * 512 + tid;
+        if (i < M4) {
+            const float4 v = reg[r];
+            char4 q;
+            q.x = (int8_t) __float2int_rn(v.x * inv_scale);
+            q.y = (int8_t) __float2int_rn(v.y * inv_scale);
+            q.z = (int8_t) __float2int_rn(v.z * inv_scale);
+            q.w = (int8_t) __float2int_rn(v.w * inv_scale);
+            out4[i] = q;
+        }
+    }
+}
+
+__global__ static void mul_signs_fwht1024_to_i8_kernel(
+        const float * __restrict__ src, const float * __restrict__ signs,
+        int8_t * __restrict__ dst_i8, float * __restrict__ out_col_scales,
+        const int M, const int N, const int64_t s11) {
+    const int j = blockIdx.x;
+    if (j >= N) {
+        return;
+    }
+    const int tid  = threadIdx.x; // 0 .. 511
+    const int warp = tid >> 5;    // 0 .. 15
+    const int lane = tid & 31;    // 0 .. 31
+    const int n_blk = M >> 10;    // M / 1024
+    const float * in_col = src + (int64_t) j * s11;
+
+    __shared__ float s[32][33];
+    constexpr int MAX_BLK = 18;
+    float reg0[MAX_BLK];
+    float reg1[MAX_BLK];
+    float cmax = 0.0f;
+
+    for (int b = 0; b < n_blk; ++b) {
+        const int i0 = b * 1024 + tid;
+        const int i1 = i0 + 512;
+        float v0 = in_col[i0] * signs[i0];
+        float v1 = in_col[i1] * signs[i1];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float a2 = __shfl_xor_sync(0xFFFFFFFF, v0, h);
+            const float b2 = __shfl_xor_sync(0xFFFFFFFF, v1, h);
+            v0 = ((lane & h) == 0) ? (v0 + a2) : (a2 - v0);
+            v1 = ((lane & h) == 0) ? (v1 + b2) : (b2 - v1);
+        }
+        s[lane][warp]      = v0;
+        s[lane][warp + 16] = v1;
+        __syncthreads();
+        float u0 = s[warp][lane];
+        float u1 = s[warp + 16][lane];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float a2 = __shfl_xor_sync(0xFFFFFFFF, u0, h);
+            const float b2 = __shfl_xor_sync(0xFFFFFFFF, u1, h);
+            u0 = ((lane & h) == 0) ? (u0 + a2) : (a2 - u0);
+            u1 = ((lane & h) == 0) ? (u1 + b2) : (b2 - u1);
+        }
+        reg0[b] = u0;
+        reg1[b] = u1;
+        cmax = fmaxf(cmax, fmaxf(fabsf(u0), fabsf(u1)));
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xFFFFFFFF, cmax, off));
+    }
+    __shared__ float smax[16];
+    if (lane == 0) {
+        smax[warp] = cmax;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float v = smax[tid];
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 8));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 4));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 2));
+        v = fmaxf(v, __shfl_xor_sync(0xFFFF, v, 1));
+        smax[0] = v;
+    }
+    __syncthreads();
+    const float max_v = smax[0];
+    const float fwht_scale = 1.0f / 32.0f;
+    const float inv_scale = max_v > 0.0f ? (127.0f / max_v) : 0.0f;
+    if (tid == 0) {
+        out_col_scales[j] = (max_v / 127.0f) * fwht_scale;
+    }
+
+    int8_t * s_i8 = (int8_t *) s;
+    int32_t * out32 = (int32_t *) (dst_i8 + (int64_t) j * M);
+    for (int b = 0; b < n_blk; ++b) {
+        s_i8[lane * 36 + warp]      = (int8_t) __float2int_rn(reg0[b] * inv_scale);
+        s_i8[lane * 36 + warp + 16] = (int8_t) __float2int_rn(reg1[b] * inv_scale);
+        __syncthreads();
+        if (tid < 256) {
+            const int r = tid >> 3;
+            const int c4 = (tid & 7) * 4;
+            out32[b * 256 + tid] = *(const int32_t *) (s_i8 + r * 36 + c4);
+        }
+        __syncthreads();
+    }
+}
+
+// Fast thin F32 matmul for decode/verify (M <= 64, N <= 8, K >= 512, e.g. 5120x48 ssm_alpha/beta):
+// 1 CTA per output row, reads src0 row ONCE as float4 and dots against all N columns in registers.
+template <int N_COLS>
+__global__ static void thin_f32_decode_kernel(
+        const float * __restrict__ src0, const float * __restrict__ src1, float * __restrict__ dst,
+        const int M, const int K, const int64_t s11, const int64_t s_dst) {
+    const int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int K4 = K >> 2;
+    const float4 * w4 = (const float4 *) (src0 + (int64_t) row * K);
+    float acc[N_COLS] = {};
+    for (int i = tid; i < K4; i += blockDim.x) {
+        const float4 w = w4[i];
+#pragma unroll
+        for (int j = 0; j < N_COLS; ++j) {
+            const float4 x = ((const float4 *) (src1 + (int64_t) j * s11))[i];
+            acc[j] += w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+        }
+    }
+    __shared__ float ssum[8][N_COLS];
+#pragma unroll
+    for (int j = 0; j < N_COLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xFFFFFFFF, v, off);
+        }
+        if ((tid & 31) == 0) {
+            ssum[tid >> 5][j] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < N_COLS) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            sum += ssum[w][tid];
+        }
+        dst[(int64_t) tid * s_dst + row] = sum;
+    }
+}
+
+// P1.2: Fast thin F32 matmul for N = 9..64 (1 CTA per (row, 8-col tile)) - eliminates 96 cublasSgemm calls in -np 8 verify!
+__global__ static void thin_f32_narrow_kernel(
+        const float * __restrict__ src0, const float * __restrict__ src1, float * __restrict__ dst,
+        const int M, const int N, const int K, const int64_t s11, const int64_t s_dst) {
+    const int row = blockIdx.x;
+    const int c0  = blockIdx.y * 8;
+    if (row >= M || c0 >= N) { return; }
+    const int n_c = min(8, N - c0);
+    const int tid = threadIdx.x;
+    const int K4  = K >> 2;
+    const float4 * w4 = (const float4 *) (src0 + (int64_t) row * K);
+    float acc[8] = {};
+    for (int i = tid; i < K4; i += blockDim.x) {
+        const float4 w = w4[i];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j < n_c) {
+                const float4 x = ((const float4 *) (src1 + (int64_t) (c0 + j) * s11))[i];
+                acc[j] += w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+            }
+        }
+    }
+    __shared__ float ssum[8][8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xFFFFFFFF, v, off);
+        }
+        if ((tid & 31) == 0) {
+            ssum[tid >> 5][j] = v;
+        }
+    }
+    __syncthreads();
+    if (tid < n_c) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            sum += ssum[w][tid];
+        }
+        dst[(int64_t) (c0 + tid) * s_dst + row] = sum;
+    }
+}
+
+static bool ggml_cuda_mul_mat_pq2_cublas_i8(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * add_src = nullptr,
+        const ggml_tensor * rms_weight = nullptr, const float rms_eps = 0.0f,
+        ggml_tensor * norm_mul_dst = nullptr, const bool skip_norm_f32_write = false,
+        const ggml_tensor * fwht_signs = nullptr, const ggml_tensor * fwht_out = nullptr) {
+    if (!ggml_cuda_pq2_cublas_i8_enabled()) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_PQ2_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    const int64_t N = src1->ne[1];
+    const int64_t min_n_cb = ggml_cuda_pq2_narrow_int8_enabled() ? (M > 65536 ? 256 : (pq2_narrow_i8_max_n() + 1)) : 129;
+    if (N < min_n_cb || (K % QK_PQ2_0) != 0 || (M % 4) != 0 || !ggml_is_contiguous(src0) ||
+            (src1->nb[0] != sizeof(float)) || (dst->nb[0] != sizeof(float))) {
+        return false;
+    }
+    if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256 && M <= 65536) {
+        return false;
+    }
+    if (add_src && (add_src->type != GGML_TYPE_F32 || !ggml_are_same_shape(add_src, dst) ||
+            add_src->nb[0] != sizeof(float) || add_src->nb[1] != dst->nb[1])) {
+        return false;
+    }
+
+    const int64_t N_pad = (N + 3) & ~int64_t(3);
+    cudaStream_t stream = ctx.stream();
+
+    const auto rs_entry = get_or_compute_pq2_row_scales((const block_pq2_0 *) src0->data, M, K, stream);
+    ggml_cuda_pool_alloc<int8_t> A_i8_tmp(ctx.pool());
+    int8_t * A_i8_ptr = rs_entry.A_i8;
+    if (A_i8_ptr == nullptr) {
+        A_i8_tmp.alloc((size_t) M * K);
+        A_i8_ptr = A_i8_tmp.get();
+        const int nkb = (int) (K / QK_PQ2_0);
+        dequant_pq2_to_i8_1pass_kernel<<<(unsigned) M, 256, 0, stream>>>(
+            (const block_pq2_0 *) src0->data, rs_entry.inv_scales, A_i8_ptr, (int) M, nkb);
+    }
+
+    int8_t * B_i8_ptr = nullptr;
+    float  * col_scales_ptr = nullptr;
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    get_or_quantize_b_i8(src1, N, N_pad, K, s11, stream, B_i8_ptr, col_scales_ptr);
+
+    ggml_cuda_pool_alloc<int32_t> C_i32(ctx.pool(), (size_t) M * N_pad);
+
+    const int32_t alpha_i = 1;
+    const int32_t beta_i  = 0;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+    CUBLAS_CHECK(cublasGemmEx(
+        ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        (int) M, (int) N_pad, (int) K,
+        &alpha_i,
+        A_i8_ptr,    CUDA_R_8I,  (int) K,
+        B_i8_ptr,    CUDA_R_8I,  (int) K,
+        &beta_i,
+        C_i32.get(), CUDA_R_32I, (int) M,
+        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    const int64_t s_dst = dst->nb[1] / sizeof(float);
+    if (add_src && rms_weight && norm_mul_dst && fwht_signs && fwht_out && pq2_b_i8_cache_enabled() &&
+            (M % 1024) == 0 && (M / 1024) <= 8 && s_dst == M) {
+        auto & st = pq2_b_i8_cache_for_stream(stream);
+        const size_t need_b = (size_t) N_pad * (size_t) M;
+        const size_t need_s = (size_t) N_pad * sizeof(float);
+        ggml_cuda_pool_alloc<float> in_cs_copy(ctx.pool(), (size_t) N_pad);
+        CUDA_CHECK(cudaMemcpyAsync(in_cs_copy.get(), col_scales_ptr, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        if (st.B_i8_cap < need_b) {
+            if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+            CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+            st.B_i8_cap = need_b;
+        }
+        if (st.col_scales_cap < need_s) {
+            if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+            CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+            st.col_scales_cap = need_s;
+        }
+        dequant_i32_add_rms_mul_fwht1024_to_i8_kernel<<<(unsigned) N, 512, 0, stream>>>(
+            C_i32.get(), rs_entry.scales, in_cs_copy.get(),
+            (const float *) add_src->data, (float *) dst->data,
+            (const float *) rms_weight->data, rms_eps,
+            (const float *) fwht_signs->data,
+            skip_norm_f32_write ? nullptr : (float *) norm_mul_dst->data,
+            st.B_i8, st.col_scales, (int) M, (int) N, s_dst);
+        st.src1_data   = fwht_out->data;
+        st.src1_nbytes = ggml_nbytes(fwht_out);
+        st.N           = N;
+        st.K           = M;
+        st.s11         = M;
+        st.valid       = true;
+    } else if (add_src && rms_weight && norm_mul_dst && pq2_b_i8_cache_enabled() && M <= 512 * 4 * 4 && s_dst == M) {
+        auto & st = pq2_b_i8_cache_for_stream(stream);
+        const size_t need_b = (size_t) N_pad * (size_t) M;
+        const size_t need_s = (size_t) N_pad * sizeof(float);
+        ggml_cuda_pool_alloc<float> in_cs_copy(ctx.pool(), (size_t) N_pad);
+        CUDA_CHECK(cudaMemcpyAsync(in_cs_copy.get(), col_scales_ptr, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        if (st.B_i8_cap < need_b) {
+            if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+            CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+            st.B_i8_cap = need_b;
+        }
+        if (st.col_scales_cap < need_s) {
+            if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+            CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+            st.col_scales_cap = need_s;
+        }
+        dequant_i32_add_rms_mul_to_i8_kernel<<<(unsigned) N, 512, 0, stream>>>(
+            C_i32.get(), rs_entry.scales, in_cs_copy.get(),
+            (const float *) add_src->data, (float *) dst->data,
+            (const float *) rms_weight->data, rms_eps,
+            skip_norm_f32_write ? nullptr : (float *) norm_mul_dst->data,
+            st.B_i8, st.col_scales, (int) M, (int) N, s_dst);
+        st.src1_data   = norm_mul_dst->data;
+        st.src1_nbytes = ggml_nbytes(norm_mul_dst);
+        st.N           = N;
+        st.K           = M;
+        st.s11         = M;
+        st.valid       = true;
+    } else {
+        const dim3 epi_grid((unsigned) ((M / 4 + 255) / 256), (unsigned) N, 1);
+        dequant_i32_to_f32_epilogue_kernel<<<epi_grid, 256, 0, stream>>>(
+            C_i32.get(), rs_entry.scales, col_scales_ptr,
+            add_src ? (const float *) add_src->data : nullptr,
+            (float *) dst->data, (int) M, (int) N, s_dst);
+        pq2_b_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_pq2_cublas_i8_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+        const ggml_tensor * src1, ggml_tensor * dst, const bool direct_to_b_cache = false,
+        const ggml_tensor * fwht_signs = nullptr, const ggml_tensor * fwht_out = nullptr, const int fwht_H = 0) {
+    if (!ggml_cuda_pq2_cublas_i8_enabled()) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc)) {
+        return false;
+    }
+    if (gate_w->type != GGML_TYPE_PQ2_0 || up_w->type != GGML_TYPE_PQ2_0 ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(gate_w, up_w) || gate_w->ne[2] != 1 || gate_w->ne[3] != 1 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const int64_t K = gate_w->ne[0];
+    const int64_t M = gate_w->ne[1];
+    const int64_t N = src1->ne[1];
+    const int64_t min_n_cb = ggml_cuda_pq2_narrow_int8_enabled() ? (M > 65536 ? 256 : (pq2_narrow_i8_max_n() + 1)) : 129;
+    if (N < min_n_cb || (K % QK_PQ2_0) != 0 || (M % 4) != 0 ||
+            !ggml_is_contiguous(gate_w) || !ggml_is_contiguous(up_w) ||
+            (src1->nb[0] != sizeof(float)) || (dst->nb[0] != sizeof(float))) {
+        return false;
+    }
+    if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256 && M <= 65536) {
+        return false;
+    }
+
+    const int64_t N_pad = (N + 3) & ~int64_t(3);
+    cudaStream_t stream = ctx.stream();
+
+    const auto gate_rs = get_or_compute_pq2_row_scales((const block_pq2_0 *) gate_w->data, M, K, stream);
+    const auto up_rs   = get_or_compute_pq2_row_scales((const block_pq2_0 *) up_w->data,   M, K, stream);
+
+    ggml_cuda_pool_alloc<int8_t> A_i8_tmp(ctx.pool());
+    if (gate_rs.A_i8 == nullptr || up_rs.A_i8 == nullptr) {
+        A_i8_tmp.alloc((size_t) M * K);
+    }
+    ggml_cuda_pool_alloc<int32_t> C_gate(ctx.pool(), (size_t) M * N_pad);
+    ggml_cuda_pool_alloc<int32_t> C_up(ctx.pool(), (size_t) M * N_pad);
+
+    // Quantize src1 ONCE (or reuse cached B_i8)!
+    int8_t * B_i8_ptr = nullptr;
+    float  * col_scales_ptr = nullptr;
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    get_or_quantize_b_i8(src1, N, N_pad, K, s11, stream, B_i8_ptr, col_scales_ptr);
+
+    const int32_t alpha_i = 1;
+    const int32_t beta_i  = 0;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+
+    const int nkb = (int) (K / QK_PQ2_0);
+
+    // Gate GEMM
+    int8_t * gate_A = gate_rs.A_i8;
+    if (gate_A == nullptr) {
+        gate_A = A_i8_tmp.get();
+        dequant_pq2_to_i8_1pass_kernel<<<(unsigned) M, 256, 0, stream>>>(
+            (const block_pq2_0 *) gate_w->data, gate_rs.inv_scales, gate_A, (int) M, nkb);
+    }
+    CUBLAS_CHECK(cublasGemmEx(
+        ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        (int) M, (int) N_pad, (int) K,
+        &alpha_i, gate_A, CUDA_R_8I, (int) K, B_i8_ptr, CUDA_R_8I, (int) K,
+        &beta_i, C_gate.get(), CUDA_R_32I, (int) M,
+        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // Up GEMM
+    int8_t * up_A = up_rs.A_i8;
+    if (up_A == nullptr) {
+        up_A = A_i8_tmp.get();
+        dequant_pq2_to_i8_1pass_kernel<<<(unsigned) M, 256, 0, stream>>>(
+            (const block_pq2_0 *) up_w->data, up_rs.inv_scales, up_A, (int) M, nkb);
+    }
+    CUBLAS_CHECK(cublasGemmEx(
+        ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        (int) M, (int) N_pad, (int) K,
+        &alpha_i, up_A, CUDA_R_8I, (int) K, B_i8_ptr, CUDA_R_8I, (int) K,
+        &beta_i, C_up.get(), CUDA_R_32I, (int) M,
+        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // Fused SwiGLU (+ optional Hadamard signs + FWHT) -> direct INT8 into B_i8 cache!
+    const int64_t s_dst = dst->nb[1] / sizeof(float);
+    if (fwht_signs && fwht_out && pq2_b_i8_cache_enabled() &&
+            (fwht_H == 1024 || fwht_H == 512 || fwht_H == 256 || fwht_H == 128) &&
+            (M % fwht_H) == 0 && (fwht_H == 1024 ? (M / 1024) <= 18 : (M / fwht_H) <= 36)) {
+        auto & st = pq2_b_i8_cache_for_stream(stream);
+        const size_t need_b = (size_t) N_pad * (size_t) M;
+        const size_t need_s = (size_t) N_pad * sizeof(float);
+        ggml_cuda_pool_alloc<float> in_cs_copy(ctx.pool(), (size_t) N_pad);
+        CUDA_CHECK(cudaMemcpyAsync(in_cs_copy.get(), col_scales_ptr, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        if (st.B_i8_cap < need_b) {
+            if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+            CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+            st.B_i8_cap = need_b;
+        }
+        if (st.col_scales_cap < need_s) {
+            if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+            CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+            st.col_scales_cap = need_s;
+        }
+        if (fwht_H == 1024) {
+            dequant_i32_swiglu_fwht1024_to_i8_kernel<<<(unsigned) N, 512, 0, stream>>>(
+                C_gate.get(), gate_rs.scales, C_up.get(), up_rs.scales, in_cs_copy.get(),
+                (const float *) fwht_signs->data, st.B_i8, st.col_scales, (int) M, (int) N);
+        } else if (fwht_H == 512) {
+            dequant_i32_swiglu_fwht_to_i8_kernel<512><<<(unsigned) N, 512, 0, stream>>>(
+                C_gate.get(), gate_rs.scales, C_up.get(), up_rs.scales, in_cs_copy.get(),
+                (const float *) fwht_signs->data, st.B_i8, st.col_scales, (int) M, (int) N);
+        } else if (fwht_H == 256) {
+            dequant_i32_swiglu_fwht_to_i8_kernel<256><<<(unsigned) N, 256, 0, stream>>>(
+                C_gate.get(), gate_rs.scales, C_up.get(), up_rs.scales, in_cs_copy.get(),
+                (const float *) fwht_signs->data, st.B_i8, st.col_scales, (int) M, (int) N);
+        } else {
+            dequant_i32_swiglu_fwht_to_i8_kernel<128><<<(unsigned) N, 128, 0, stream>>>(
+                C_gate.get(), gate_rs.scales, C_up.get(), up_rs.scales, in_cs_copy.get(),
+                (const float *) fwht_signs->data, st.B_i8, st.col_scales, (int) M, (int) N);
+        }
+        st.src1_data   = fwht_out->data;
+        st.src1_nbytes = ggml_nbytes(fwht_out);
+        st.N           = N;
+        st.K           = M;
+        st.s11         = M;
+        st.valid       = true;
+    } else if (direct_to_b_cache && pq2_b_i8_cache_enabled() && M <= 512 * 4 * 9 && s_dst == M) {
+        auto & st = pq2_b_i8_cache_for_stream(stream);
+        const size_t need_b = (size_t) N_pad * (size_t) M;
+        const size_t need_s = (size_t) N_pad * sizeof(float);
+        // Ensure we don't alias the input B_i8/col_scales we just read (they are done after GEMMs,
+        // EXCEPT in_col_scales is still read by the epilogue, so copy/keep in_col_scales in pool!)
+        ggml_cuda_pool_alloc<float> in_cs_copy(ctx.pool(), (size_t) N_pad);
+        CUDA_CHECK(cudaMemcpyAsync(in_cs_copy.get(), col_scales_ptr, (size_t) N * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        if (st.B_i8_cap < need_b) {
+            if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+            CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+            st.B_i8_cap = need_b;
+        }
+        if (st.col_scales_cap < need_s) {
+            if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+            CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+            st.col_scales_cap = need_s;
+        }
+        dequant_i32_swiglu_to_i8_epilogue_kernel<<<(unsigned) N, 512, 0, stream>>>(
+            C_gate.get(), gate_rs.scales, C_up.get(), up_rs.scales, in_cs_copy.get(),
+            st.B_i8, st.col_scales, (int) M, (int) N);
+        st.src1_data   = dst->data;
+        st.src1_nbytes = ggml_nbytes(dst);
+        st.N           = N;
+        st.K           = M;
+        st.s11         = M;
+        st.valid       = true;
+    } else {
+        const dim3 epi_grid((unsigned) ((M / 4 + 255) / 256), (unsigned) N, 1);
+        dequant_i32_swiglu_epilogue_kernel<<<epi_grid, 256, 0, stream>>>(
+            C_gate.get(), gate_rs.scales, C_up.get(), up_rs.scales, col_scales_ptr,
+            (float *) dst->data, (int) M, (int) N, s_dst);
+        pq2_b_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
@@ -1867,8 +6209,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1 (and PQ2_0 multi-column 1..8)
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+        !(src0->type == GGML_TYPE_PQ2_0 && ggml_cuda_pq2_multicol(dst->ne[1]))) {
         return false;
     }
 
@@ -1891,14 +6234,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    if (ggml_cuda_pq2_narrow_int8_enabled() && src0->type == GGML_TYPE_PQ2_0 &&
+            src1->ne[1] >= 5 && src1->ne[1] <= pq2_narrow_i8_max_n() && src0->ne[1] <= 262144) {
+        return false;
+    }
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1 (and PQ2_0 multi-column 1..8)
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+        !(src0->type == GGML_TYPE_PQ2_0 && ggml_cuda_pq2_multicol(dst->ne[1]))) {
         return false;
     }
 
@@ -2162,6 +6510,71 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ne11 >= 1 && ne11 <= 8 && ne00 >= 512 && (ne00 % 4) == 0 && ne01 <= 64 &&
+            ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const int64_t K = ne00, M = ne01, s11 = src1->nb[1] / sizeof(float), s_dst = dst->nb[1] / sizeof(float);
+        cudaStream_t stream = ctx.stream();
+        switch (ne11) {
+            case 1: thin_f32_decode_kernel<1><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 2: thin_f32_decode_kernel<2><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 3: thin_f32_decode_kernel<3><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 4: thin_f32_decode_kernel<4><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 5: thin_f32_decode_kernel<5><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 6: thin_f32_decode_kernel<6><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 7: thin_f32_decode_kernel<7><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+            case 8: thin_f32_decode_kernel<8><<<(unsigned) M, 256, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) K, s11, s_dst); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (ggml_cuda_mul_mat_f32_narrow_f16_tc(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ne11 >= 9 && ne11 <= 64 && ne00 >= 512 && (ne00 % 4) == 0 && ne01 <= 64 &&
+            ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const int64_t K = ne00, M = ne01, N = ne11, s11 = src1->nb[1] / sizeof(float), s_dst = dst->nb[1] / sizeof(float);
+        dim3 grid((unsigned) M, (unsigned) ((N + 7) / 8));
+        thin_f32_narrow_kernel<<<grid, 256, 0, ctx.stream()>>>(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) M, (int) N, (int) K, s11, s_dst);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (ggml_cuda_mul_mat_f32_prefill_f16_tc(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_cuda_pq2_cublas_i8_enabled() && turing_mma_available(cc) &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ne11 >= 65 && ne00 >= 512 && (ne00 % 4) == 0 && ne01 <= 64 && (ne01 % 4) == 0 &&
+            (strstr(src0->name, "ssm_alpha") != nullptr || strstr(src0->name, "ssm_beta") != nullptr) &&
+            ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const int64_t K = ne00, M = ne01, N = ne11;
+        const int64_t N_pad = (N + 3) & ~int64_t(3);
+        cudaStream_t stream = ctx.stream();
+        const auto ae = get_or_quantize_thin_f32((const float *) src0->data, M, K, stream);
+        int8_t * B_i8_ptr = nullptr;
+        float  * col_scales_ptr = nullptr;
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        get_or_quantize_b_i8(src1, N, N_pad, K, s11, stream, B_i8_ptr, col_scales_ptr);
+        ggml_cuda_pool_alloc<int32_t> C_i32(ctx.pool(), (size_t) M * N_pad);
+        const int32_t alpha_i = 1, beta_i = 0;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+        CUBLAS_CHECK(cublasGemmEx(
+            ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, (int) M, (int) N_pad, (int) K,
+            &alpha_i, ae.A_i8, CUDA_R_8I, (int) K, B_i8_ptr, CUDA_R_8I, (int) K,
+            &beta_i, C_i32.get(), CUDA_R_32I, (int) M, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        const int64_t s_dst = dst->nb[1] / sizeof(float);
+        const dim3 epi_grid((unsigned) ((M / 4 + 255) / 256), (unsigned) N, 1);
+        dequant_i32_to_f32_epilogue_kernel<<<epi_grid, 256, 0, stream>>>(
+            C_i32.get(), ae.scales, col_scales_ptr, nullptr, (float *) dst->data, (int) M, (int) N, s_dst);
+        pq2_b_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -2174,8 +6587,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_pq2_0_ordered(ctx, src0, src1, dst);
         return;
     }
+    if (ggml_cuda_mul_mat_pq2_narrow_int8(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (ggml_cuda_mul_mat_pq2_prefill_int4(ctx, src0, src1, dst)) {
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_mul_mat_pq2_cublas_i8(ctx, src0, src1, dst)) {
         return;
     }
     if ((src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_PQ2_0) && ne11 >= 128
@@ -2703,6 +7125,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            ggml_cuda_op_gated_delta_net_replay(ctx, dst, nullptr);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -3425,6 +7850,11 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
                 (signs && signs->ne[0] != u.K)) {
             return 0;
         }
+        if (u.wtype == GGML_TYPE_PQ2_0 &&
+                ((ggml_cuda_pq2_narrow_int8_enabled() && u.ncols >= 5 && u.ncols <= 128) ||
+                 (ggml_cuda_pq2_cublas_i8_enabled() && u.ncols >= 129))) {
+            return 0;
+        }
         // rows in the rotation's own F32 output (4 bytes per value vs 1.125: room for the MMQ tile reads past the
         // last column; a stable address, so CUDA graphs stay valid), or in a pool block held for this graph when
         // that buffer overlaps the input (see out_aliases_in above)
@@ -3455,6 +7885,9 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     const int64_t K     = u.K;
     const int64_t ncols = u.ncols;
     const ggml_type wtype = u.wtype;
+    if (ggml_cuda_pq2_narrow_int8_enabled() && wtype == GGML_TYPE_PQ2_0 && ncols >= 5 && ncols <= 128) {
+        return 0;
+    }
     int64_t ne0_padded = 0;
     ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
     if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
@@ -3575,7 +8008,8 @@ static bool ggml_cuda_gdn_conv_match(ggml_backend_cuda_context & ctx, const ggml
     const int64_t d_conv = s0->ne[0] + 1;
     const int64_t C      = cc->ne[1];
     const int64_t n_t    = cc->ne[0] - (d_conv - 1);
-    if (d_conv < 3 || d_conv > 5 || C > INT_MAX / 8 || n_t < 1 || n_t > GGML_CUDA_GDN_CONV_MAX_TOKENS) {
+    const bool prefill_conv = (n_t > GGML_CUDA_GDN_CONV_MAX_TOKENS && n_t <= 8192 && d_conv == 4);
+    if (d_conv < 3 || d_conv > 5 || C > INT_MAX / 8 || n_t < 1 || (!prefill_conv && n_t > GGML_CUDA_GDN_CONV_MAX_TOKENS)) {
         return false;
     }
     if (s0->ne[1] != C || !gr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 ||
@@ -3701,7 +8135,7 @@ static bool ggml_cuda_gdn_conv_match(ggml_backend_cuda_context & ctx, const ggml
     float eps;
     memcpy(&eps, l2->op_params, sizeof(float));
     if (row_len % WARP_SIZE != 0 || row_len >= 1024 || C % row_len != 0 || n_l2 > C || eps < 0.0f ||
-            ((d_conv - 1 + 2*n_t)*row_len + n_t)*sizeof(float) > 48*1024) {
+            (!prefill_conv && ((d_conv - 1 + 2*n_t)*row_len + n_t)*sizeof(float) > 48*1024)) {
         return false;
     }
 
@@ -3829,6 +8263,103 @@ static bool ggml_cuda_try_gdn_conv_gather_skip(ggml_backend_cuda_context & ctx, 
     return false;
 }
 
+// Tiled 2D race-free prefill fused GDN conv1d (d_conv=4) + SiLU + snapshot:
+// Pass 1 saves only the 3 boundary halo tokens per T_TILE=64 tile (3.9 MB) + cache snapshots.
+// Pass 2 launches (C/128) x (n_t/64) = 2,560 CTAs saturating all SMs, 1 coalesced read + 1 write/token,
+// 100% safe even when y == x in-place!
+constexpr int GDN_PREFILL_CONV_TILE = 64;
+
+__global__ static void gdn_prefill_conv_halo_kernel(
+        ggml_cuda_ssm_conv_gdn_fused_args a, float * __restrict__ halo, const int n_tiles) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= a.n_channels) {
+        return;
+    }
+    const int row_idx = a.ids[0];
+    const float * c_row = a.cache + (int64_t) row_idx * a.row_stride + (int64_t) c * 3;
+    const float * x_c   = a.x + (int64_t) c * a.x_stride;
+    const int64_t x_ts  = a.x_tok_stride;
+
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        const int t0 = tile * GDN_PREFILL_CONV_TILE;
+        float * h = halo + ((int64_t) tile * a.n_channels + c) * 3;
+        if (tile == 0) {
+            h[0] = c_row[0];
+            h[1] = c_row[1];
+            h[2] = c_row[2];
+        } else {
+            h[0] = x_c[(int64_t) (t0 - 3) * x_ts];
+            h[1] = x_c[(int64_t) (t0 - 2) * x_ts];
+            h[2] = x_c[(int64_t) (t0 - 1) * x_ts];
+        }
+    }
+    for (int k = 0; k < a.n_snap; ++k) {
+        float * dst = a.cache_dst + a.snap_offs[k] + (int64_t) c * 3;
+        const int sp = a.snap_pos[k];
+        float vals[3];
+#pragma unroll
+        for (int tap = 0; tap < 3; ++tap) {
+            const int pos = sp + tap;
+            vals[tap] = (pos < 3) ? c_row[pos] : x_c[(int64_t) (pos - 3) * x_ts];
+        }
+        dst[0] = vals[0];
+        dst[1] = vals[1];
+        dst[2] = vals[2];
+    }
+}
+
+__global__ static void gdn_prefill_conv_silu_tiled_kernel(
+        ggml_cuda_ssm_conv_gdn_fused_args a, const float * __restrict__ halo) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tile = blockIdx.y;
+    const int t0 = tile * GDN_PREFILL_CONV_TILE;
+    if (c >= a.n_channels || t0 >= a.n_t) {
+        return;
+    }
+    const float * wc = a.w + (int64_t) c * a.w_stride;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    const float * h = halo + ((int64_t) tile * a.n_channels + c) * 3;
+    float r0 = h[0], r1 = h[1], r2 = h[2];
+
+    const float * x_c = a.x + (int64_t) c * a.x_stride;
+    float * y_c = a.y + c;
+    const int64_t x_ts = a.x_tok_stride;
+    const int64_t y_ts = a.n_channels;
+    const int t_end = min(t0 + GDN_PREFILL_CONV_TILE, a.n_t);
+
+    const bool do_l2 = (a.row_len == 128) && (blockIdx.x * 128 < (unsigned) a.n_l2);
+    __shared__ float sw[2][4];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const float eps2 = a.eps * a.eps;
+    float * l2_c = a.l2 + c;
+
+    for (int t = t0; t < t_end; ++t) {
+        const float r3 = x_c[(int64_t) t * x_ts];
+        const float v = r0 * w0 + r1 * w1 + r2 * w2 + r3 * w3;
+        const float sv = v / (1.0f + __expf(-v));
+        if (do_l2) {
+            const int b = t & 1;
+            float sq = sv * sv;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                sq += __shfl_xor_sync(0xFFFFFFFF, sq, off);
+            }
+            if (lane == 0) {
+                sw[b][warp] = sq;
+            }
+            __syncthreads();
+            const float tot = sw[b][0] + sw[b][1] + sw[b][2] + sw[b][3];
+            l2_c[(int64_t) t * a.n_l2] = sv * rsqrtf(fmaxf(tot, eps2));
+        } else {
+            y_c[(int64_t) t * y_ts] = sv;
+        }
+        r0 = r1;
+        r1 = r2;
+        r2 = r3;
+    }
+}
+
 // at the CONCAT whose GET_ROWS was skipped: one launch for the chain
 static bool ggml_cuda_try_gdn_conv_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     auto & reg = ctx.gdn_conv();
@@ -3842,6 +8373,24 @@ static bool ggml_cuda_try_gdn_conv_fused(ggml_backend_cuda_context & ctx, const 
         // not expected (the match is a pure function of the graph): materialise the skipped gather, run unfused
         ggml_cuda_op_get_rows(ctx, const_cast<ggml_tensor *>(it->second));
         return false;
+    }
+    if (p.args.n_t > GGML_CUDA_GDN_CONV_MAX_TOKENS) {
+        cudaStream_t stream = ctx.stream();
+        const int n_tiles = (p.args.n_t + GDN_PREFILL_CONV_TILE - 1) / GDN_PREFILL_CONV_TILE;
+        ggml_cuda_pool_alloc<float> halo(ctx.pool(), (size_t) n_tiles * (size_t) p.args.n_channels * 3);
+        const unsigned c_blocks = (unsigned) ((p.args.n_channels + 127) / 128);
+        gdn_prefill_conv_halo_kernel<<<c_blocks, 128, 0, stream>>>(p.args, halo.get(), n_tiles);
+        gdn_prefill_conv_silu_tiled_kernel<<<dim3(c_blocks, (unsigned) n_tiles, 1), 128, 0, stream>>>(p.args, halo.get());
+        CUDA_CHECK(cudaGetLastError());
+        for (int k = 0; k < p.n_cpy; ++k) {
+            reg.done.insert(cgraph->nodes[p.i_cpy[k]]);
+        }
+        reg.done.insert(cgraph->nodes[p.i_conv]);
+        reg.done.insert(cgraph->nodes[p.i_conv + 1]);
+        if (p.args.row_len == 128) {
+            reg.done.insert(cgraph->nodes[p.i_l2]);
+        }
+        return true;
     }
     ggml_cuda_ssm_conv_gdn_fused(ctx, p.args);
     for (int k = 0; k < p.n_cpy; ++k) {
@@ -3882,7 +8431,7 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
     const ggml_tensor * cur = gr;
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
+        if ((n->op == GGML_OP_GATED_DELTA_NET || n->op == GGML_OP_GATED_DELTA_NET_REPLAY) && n->src[5] == cur) {
             const ggml_tensor * v = n->src[2];
             const int64_t       D = v->ne[0] * v->ne[0] * v->ne[1];
             if (gr->ne[0] != D || v->ne[3] != 1 || ggml_nelements(cur) != D) {
@@ -3988,6 +8537,123 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    return skip;
+}
+
+// Match GATED_DELTA_NET_REPLAY + CPY (base -> plane 0) (+ SET_ROWS for n_seqs == 1).
+// For n_seqs > 1, fuses CPY (eliminating the D*n_seqs copy) while leaving SET_ROWS unfused for cell-swap safety.
+static int ggml_cuda_try_gdn_replay_fusion(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_replay_fused & fused) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET_REPLAY || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       D        = S_v * S_v * H;
+    const int64_t       R        = H * (2 * S_v + 1);
+    const size_t        base_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    const size_t        rec_off  = base_off + ggml_row_size(GGML_TYPE_F32, D * n_seqs);
+
+    const ggml_tensor * cpy  = nullptr;
+    const ggml_tensor * sr   = nullptr;
+    int                 skip = 0;
+    const bool          want_sr = (n_seqs == 1);
+    int                 n_sr_multi = 0;
+    const ggml_tensor * sr_first = nullptr;
+    int64_t             sr_cell_stride_bytes = 0;
+    const int64_t       rec_elems = R * (K - 1);
+    const size_t        rec_bytes = ggml_row_size(GGML_TYPE_F32, rec_elems);
+    int                 skip_after_cpy = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+        if (n->op == GGML_OP_CPY && cpy == nullptr) {
+            cpy = n;
+            skip = j - node_idx;
+            skip_after_cpy = skip;
+        } else if (want_sr && n->op == GGML_OP_SET_ROWS && sr == nullptr) {
+            sr = n;
+            skip = j - node_idx;
+            break;
+        } else if (!want_sr && cpy != nullptr && n->op == GGML_OP_SET_ROWS && n_sr_multi < n_seqs) {
+            const ggml_tensor * rs = n->src[0];
+            const ggml_tensor * ri = n->src[1];
+            const int64_t si = n_sr_multi;
+            bool ok = rs->op == GGML_OP_VIEW && rs->view_src == gdn &&
+                      rs->view_offs == rec_off + (size_t) si * rec_bytes &&
+                      ggml_is_contiguous(rs) && rs->ne[0] == rec_elems && ggml_nrows(rs) == 1 &&
+                      n->type == GGML_TYPE_F32 && n->data != nullptr &&
+                      n->ne[0] == rec_elems && n->nb[0] == sizeof(float) && n->nb[1] == rec_bytes &&
+                      ri->type == GGML_TYPE_I64 && ggml_nelements(ri) == 1 && ri->data != nullptr &&
+                      !(ri->buffer && ggml_backend_buffer_is_host(ri->buffer));
+            if (ok && si == 0) {
+                sr_first = n;
+            } else if (ok && si == 1) {
+                sr_cell_stride_bytes = (int64_t) ((const char *) n->data - (const char *) sr_first->data);
+                ok = sr_cell_stride_bytes > 0 && (sr_cell_stride_bytes % (int64_t) sizeof(float)) == 0 &&
+                     ((const char *) ri->data - (const char *) sr_first->src[1]->data) == (int64_t) sizeof(int64_t);
+            } else if (ok && si > 1) {
+                ok = ((const char *) n->data - (const char *) sr_first->data) == si * sr_cell_stride_bytes &&
+                     ((const char *) ri->data - (const char *) sr_first->src[1]->data) == si * (int64_t) sizeof(int64_t);
+            }
+            if (!ok) {
+                n_sr_multi = -1;
+                break;
+            }
+            ++n_sr_multi;
+            if (n_sr_multi == n_seqs) {
+                skip = j - node_idx;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * cs = cpy->src[0];
+    const ggml_tensor * cd = cpy->src[1];
+    if (cs->op != GGML_OP_VIEW || cs->view_src != gdn || cs->view_offs != base_off || !ggml_is_contiguous(cs) ||
+        ggml_nelements(cs) != D * n_seqs || cd->type != GGML_TYPE_F32 || cd->data == nullptr ||
+        !ggml_is_contiguous(cd)) {
+        return 0;
+    }
+    fused.base = (float *) cd->data;
+    fused.rec  = nullptr;
+    if (want_sr && sr != nullptr) {
+        const ggml_tensor * rs = sr->src[0];
+        const ggml_tensor * ri = sr->src[1];
+        if (rs->op == GGML_OP_VIEW && rs->view_src == gdn && rs->view_offs == rec_off && ggml_is_contiguous(rs) &&
+            rs->ne[0] == R * (K - 1) && ggml_nrows(rs) == 1 && sr->type == GGML_TYPE_F32 && sr->data != nullptr &&
+            sr->ne[0] == R * (K - 1) && sr->nb[0] == sizeof(float) && sr->nb[1] % sizeof(float) == 0 &&
+            ri->type == GGML_TYPE_I64 && ggml_nelements(ri) == 1 && ri->data != nullptr &&
+            !(ri->buffer && ggml_backend_buffer_is_host(ri->buffer))) {
+            fused.rec            = (float *) sr->data;
+            fused.rec_rows       = (const int64_t *) ri->data;
+            fused.rec_row_stride = (int64_t) (sr->nb[1] / sizeof(float));
+        } else {
+            return 0;
+        }
+    } else if (!want_sr && n_sr_multi == n_seqs && sr_first != nullptr) {
+        fused.rec_batch_dst         = (float *) sr_first->data;
+        fused.rec_batch_wrows       = (const int64_t *) sr_first->src[1]->data;
+        fused.rec_batch_cell_stride = sr_cell_stride_bytes / (int64_t) sizeof(float);
+        fused.rec_batch_bank_stride = rec_elems;
+    } else if (!want_sr) {
+        skip = skip_after_cpy;
+    }
     return skip;
 }
 
@@ -5139,6 +9805,9 @@ static bool ggml_cuda_norm_fwht_q8_prepare(const ggml_cgraph * cgraph, const int
         return false;
     }
     const ggml_tensor * mm = cgraph->nodes[i_mm];
+    if (ggml_cuda_pq2_narrow_int8_enabled() && ggml_nelements(mm) >= 5 * n) {
+        return false;
+    }
     const char * m0 = (const char *) mm->data;
     const char * m1 = m0 + ggml_nbytes(mm);
     for (int k = 0; k < n_srcs && ggml_nelements(mm) > n; ++k) {
@@ -5441,6 +10110,80 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     weight->data != mm->data && signs->data != mm->data &&
                     ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 2) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 2, false, true)) {
+                // Narrow INT8 (N=5..128) fast path: fuse ADD + RMS_NORM + MUL(w) + MUL(signs) + FWHT(1024) directly into 2-nibble B_i8!
+                if (ggml_cuda_pq2_narrow_int8_enabled() && (int) mm->src[0]->ne[0] == 1024 &&
+                        (ncols % 1024) == 0 && (ncols >> 10) <= 24 && node->ne[1] >= 5 && node->ne[1] <= pq2_narrow_i8_max_n() &&
+                        node->ne[2] == 1 && node->ne[3] == 1 && (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                    bool fwht_only_pq2 = true;
+                    int n_pq2 = 0;
+                    for (int jj = i + 6; jj < cgraph->n_nodes && fwht_only_pq2; ++jj) {
+                        const ggml_tensor * cn = cgraph->nodes[jj];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            if (cn->src[s] == mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == mm)) {
+                                if (cn->op == GGML_OP_RESHAPE) { continue; }
+                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 262144) {
+                                    ++n_pq2;
+                                } else {
+                                    fwht_only_pq2 = false; break;
+                                }
+                            }
+                        }
+                    }
+                    if (fwht_only_pq2 && n_pq2 >= 1) {
+                        cudaStream_t stream = cuda_ctx->stream();
+                        const int64_t N = node->ne[1], N_pad = pq2_narrow_i8_n_pad(N);
+                        auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+                        if (pq2_narrow_i8_alloc_bufs(sc, N_pad, ncols, stream)) {
+                            float eps = 0.0f; memcpy(&eps, rms_norm->op_params, sizeof(float));
+                            rms_mul_signs_fwht1024_to_narrow_i8_kernel<<<(unsigned) N_pad, (unsigned) ((ncols >> 10) * 32), 0, stream>>>(
+                                (const float *) a->data, (const float *) b->data, (float *) node->data,
+                                (const float *) weight->data, eps, (const float *) signs->data, nullptr,
+                                sc.B_i8, sc.B_sum, sc.B_scales, (int) ncols, (int) N, (int) N_pad, ncols);
+                            CUDA_CHECK(cudaGetLastError());
+                            sc.src1_data = mm->data; sc.src1_nbytes = ggml_nbytes(mm);
+                            sc.N = N; sc.K = ncols; sc.s11 = ncols; sc.valid = true; ++sc.gen;
+                            return 5;
+                        }
+                    }
+                }
+                // Prefill-only INT4 fast path: fuse ADD + RMS_NORM + MUL(w) + MUL(signs) + FWHT(1024) directly into B_s4!
+                if (ggml_cuda_pq2_prefill_int4_enabled() && (int) mm->src[0]->ne[0] == 1024 &&
+                        (ncols % 1024) == 0 && (ncols >> 10) <= 24 && node->ne[1] >= 256 &&
+                        node->ne[2] == 1 && node->ne[3] == 1 && (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                    bool fwht_only_pq2 = true;
+                    int n_pq2 = 0;
+                    for (int jj = i + 6; jj < cgraph->n_nodes && fwht_only_pq2; ++jj) {
+                        const ggml_tensor * cn = cgraph->nodes[jj];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            if (cn->src[s] == mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == mm)) {
+                                if (cn->op == GGML_OP_RESHAPE) { continue; }
+                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 65536) {
+                                    ++n_pq2;
+                                } else {
+                                    fwht_only_pq2 = false; break;
+                                }
+                            }
+                        }
+                    }
+                    if (fwht_only_pq2 && n_pq2 >= 1) {
+                        cudaStream_t stream = cuda_ctx->stream();
+                        const int64_t N = node->ne[1], N_pad = ((N + 127) / 128) * 128;
+                        auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+                        const size_t need_b = (size_t) N_pad * (size_t) (ncols >> 3) * sizeof(uint32_t);
+                        const size_t need_s = (size_t) N_pad * sizeof(float);
+                        if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+                        if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+                        float eps = 0.0f; memcpy(&eps, rms_norm->op_params, sizeof(float));
+                        rms_mul_signs_fwht1024_to_s4_kernel<<<(unsigned) N_pad, (unsigned) ((ncols >> 10) * 32), 0, stream>>>(
+                            (const float *) a->data, (const float *) b->data, (float *) node->data,
+                            (const float *) weight->data, eps, (const float *) signs->data, nullptr, nullptr,
+                            sc.B_i4, sc.B_scales, (int) ncols, (int) N, (int) N_pad, ncols, ggml_cuda_pq2_prefill_int4_clip());
+                        CUDA_CHECK(cudaGetLastError());
+                        sc.src1_data = mm->data; sc.src1_nbytes = ggml_nbytes(mm);
+                        sc.N = N; sc.K = ncols; sc.s11 = ncols; sc.valid = true;
+                        return 5;
+                    }
+                }
                 ggml_cuda_norm_fwht_q8_plan plan;
                 const ggml_tensor * q8_srcs[2] = { a, b };
                 if (ggml_cuda_norm_fwht_q8_prepare(cgraph, i + 5, ncols, q8_srcs, 2, plan)) {
@@ -5528,14 +10271,137 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
             if (ok) {
-                ggml_cuda_norm_fwht_q8_plan plan;
-                const ggml_tensor * q8_srcs[1] = { x };
-                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, j + 2, ncols, q8_srcs, 1, plan)) {
-                    ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm, mm->data, plan.layout);
-                    ggml_cuda_norm_fwht_q8_register(*cuda_ctx, mm, plan);
-                } else {
-                    ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm);
+                bool did_s4 = false;
+                if (ggml_cuda_pq2_prefill_int4_enabled() && (int) mm->src[0]->ne[0] == 1024 &&
+                        (ncols % 1024) == 0 && (ncols >> 10) <= 24 && x->ne[1] >= 256 &&
+                        x->ne[2] == 1 && x->ne[3] == 1) {
+                    bool safe_s4 = true;
+                    for (int k = i + 2; k < j && safe_s4; ++k) {
+                        const ggml_tensor * t = cgraph->nodes[k];
+                        if (t->op == GGML_OP_MUL_MAT && t->src[0] && t->src[0]->type == GGML_TYPE_PQ2_0) {
+                            safe_s4 = false;
+                        }
+                    }
+                    int n_pq2 = 0;
+                    for (int jj = j + 3; jj < cgraph->n_nodes && safe_s4; ++jj) {
+                        const ggml_tensor * cn = cgraph->nodes[jj];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            if (cn->src[s] == mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == mm)) {
+                                if (cn->op == GGML_OP_RESHAPE) { continue; }
+                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 65536) {
+                                    ++n_pq2;
+                                } else {
+                                    safe_s4 = false; break;
+                                }
+                            }
+                        }
+                    }
+                    if (safe_s4 && n_pq2 >= 1) {
+                        cudaStream_t stream = cuda_ctx->stream();
+                        const int64_t N = x->ne[1], N_pad = ((N + 127) / 128) * 128;
+                        auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+                        const size_t need_b = (size_t) N_pad * (size_t) (ncols >> 3) * sizeof(uint32_t);
+                        const size_t need_s = (size_t) N_pad * sizeof(float);
+                        if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+                        if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+                        const bool need_mw = (ggml_node_get_use_count(cgraph, i + 1) > 1) || ((mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) != 0);
+                        bool mw_only_small_f32_mm = need_mw && ((mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) == 0);
+                        if (mw_only_small_f32_mm) {
+                            for (int jj = i + 2; jj < cgraph->n_nodes && mw_only_small_f32_mm; ++jj) {
+                                const ggml_tensor * cn = cgraph->nodes[jj];
+                                if (cn == mul_s) { continue; }
+                                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                                    if (cn->src[s] == mul_w) {
+                                        if (!(s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] &&
+                                                cn->src[0]->type == GGML_TYPE_F32 && cn->src[0]->ne[1] <= 64 &&
+                                                strstr(cn->src[0]->name, "lora") == nullptr &&
+                                                ggml_is_contiguous(cn->src[0]) && ggml_is_contiguous(cn))) {
+                                            mw_only_small_f32_mm = false; break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        half * mw_f16_ptr = nullptr;
+                        if (mw_only_small_f32_mm) {
+                            const size_t need_mw_f16 = (size_t) N * (size_t) ncols * sizeof(half);
+                            if (sc.cap_mw_f16 < need_mw_f16) {
+                                if (sc.mul_w_f16) { CUDA_CHECK(cudaFree(sc.mul_w_f16)); }
+                                CUDA_CHECK(cudaMalloc(&sc.mul_w_f16, need_mw_f16));
+                                sc.cap_mw_f16 = need_mw_f16;
+                            }
+                            mw_f16_ptr = sc.mul_w_f16;
+                        }
+                        float eps = 0.0f; memcpy(&eps, node->op_params, sizeof(float));
+                        rms_mul_signs_fwht1024_to_s4_kernel<<<(unsigned) N_pad, (unsigned) ((ncols >> 10) * 32), 0, stream>>>(
+                            (const float *) x->data, nullptr, nullptr,
+                            (const float *) weight->data, eps, (const float *) signs->data,
+                            (need_mw && !mw_f16_ptr) ? (float *) mul_w->data : nullptr, mw_f16_ptr,
+                            sc.B_i4, sc.B_scales, (int) ncols, (int) N, (int) N_pad, ncols, ggml_cuda_pq2_prefill_int4_clip());
+                        CUDA_CHECK(cudaGetLastError());
+                        sc.src1_data = mm->data; sc.src1_nbytes = ggml_nbytes(mm);
+                        sc.N = N; sc.K = ncols; sc.s11 = ncols; sc.valid = true;
+                        if (mw_f16_ptr) {
+                            sc.mw_data = mul_w->data; sc.mw_nbytes = ggml_nbytes(mul_w);
+                            sc.mw_N = N; sc.mw_K = ncols; sc.mw_valid = true;
+                        }
+                        did_s4 = true;
+                    }
                 }
+                if (!did_s4 && ggml_cuda_pq2_narrow_int8_enabled() && (int) mm->src[0]->ne[0] == 1024 &&
+                        (ncols % 1024) == 0 && (ncols >> 10) <= 24 && x->ne[1] >= 5 && x->ne[1] <= pq2_narrow_i8_max_n() &&
+                        x->ne[2] == 1 && x->ne[3] == 1) {
+                    bool safe_ni8 = true;
+                    for (int k = i + 2; k < j && safe_ni8; ++k) {
+                        const ggml_tensor * t = cgraph->nodes[k];
+                        if (t->op == GGML_OP_MUL_MAT && t->src[0] && t->src[0]->type == GGML_TYPE_PQ2_0) {
+                            safe_ni8 = false;
+                        }
+                    }
+                    int n_pq2 = 0;
+                    for (int jj = j + 3; jj < cgraph->n_nodes && safe_ni8; ++jj) {
+                        const ggml_tensor * cn = cgraph->nodes[jj];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            if (cn->src[s] == mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == mm)) {
+                                if (cn->op == GGML_OP_RESHAPE) { continue; }
+                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 262144) {
+                                    ++n_pq2;
+                                } else {
+                                    safe_ni8 = false; break;
+                                }
+                            }
+                        }
+                    }
+                    if (safe_ni8 && n_pq2 >= 1) {
+                        cudaStream_t stream = cuda_ctx->stream();
+                        const int64_t N = x->ne[1], N_pad = pq2_narrow_i8_n_pad(N);
+                        auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+                        if (pq2_narrow_i8_alloc_bufs(sc, N_pad, ncols, stream)) {
+                            const bool need_mw = (ggml_node_get_use_count(cgraph, i + 1) > 1) || ((mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) != 0);
+                            float eps = 0.0f; memcpy(&eps, node->op_params, sizeof(float));
+                            rms_mul_signs_fwht1024_to_narrow_i8_kernel<<<(unsigned) N_pad, (unsigned) ((ncols >> 10) * 32), 0, stream>>>(
+                                (const float *) x->data, nullptr, nullptr,
+                                (const float *) weight->data, eps, (const float *) signs->data,
+                                need_mw ? (float *) mul_w->data : nullptr,
+                                sc.B_i8, sc.B_sum, sc.B_scales, (int) ncols, (int) N, (int) N_pad, ncols);
+                            CUDA_CHECK(cudaGetLastError());
+                            sc.src1_data = mm->data; sc.src1_nbytes = ggml_nbytes(mm);
+                            sc.N = N; sc.K = ncols; sc.s11 = ncols; sc.valid = true; ++sc.gen;
+                            did_s4 = true;
+                        }
+                    }
+                }
+                if (!did_s4) {
+                    ggml_cuda_norm_fwht_q8_plan plan;
+                    const ggml_tensor * q8_srcs[1] = { x };
+                    if (ggml_cuda_norm_fwht_q8_prepare(cgraph, j + 2, ncols, q8_srcs, 1, plan)) {
+                        ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm, mm->data, plan.layout);
+                        ggml_cuda_norm_fwht_q8_register(*cuda_ctx, mm, plan);
+                    } else {
+                        ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm);
+                    }
+                }
+                
                 auto & pre = cuda_ctx->fwht_q8().precomputed;
                 pre.insert(mul_s);
                 pre.insert(reshape);
@@ -5699,6 +10565,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_GATED_DELTA_NET_REPLAY) {
+        ggml_cuda_gdn_replay_fused fused_rpl;
+        const int nodes_to_skip = ggml_cuda_try_gdn_replay_fusion(cgraph, i, fused_rpl);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_gated_delta_net_replay(*cuda_ctx, node, &fused_rpl);
             return nodes_to_skip;
         }
     }
@@ -6242,7 +11117,85 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    ggml_get_op_params_i32(glu, 1) == 0 && gate->src[1] == up->src[1]) {
+                // Check for SwiGLU -> MUL(signs) -> RESHAPE -> MUL_MAT(HADAMARD) -> [RESHAPE] -> PQ2_0 ffn_down!
+                const ggml_tensor * fwht_signs = nullptr;
+                const ggml_tensor * fwht_out   = nullptr;
+                int fwht_H = 0;
+                int extra_fused = 0;
+                if (i + 5 < cgraph->n_nodes &&
+                        cgraph->nodes[i + 3]->op == GGML_OP_MUL &&
+                        cgraph->nodes[i + 4]->op == GGML_OP_RESHAPE &&
+                        cgraph->nodes[i + 5]->op == GGML_OP_MUL_MAT &&
+                        ggml_get_op_params_i32(cgraph->nodes[i + 5], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                    ggml_tensor * mul_s   = cgraph->nodes[i + 3];
+                    ggml_tensor * rsh     = cgraph->nodes[i + 4];
+                    ggml_tensor * fwht_mm = cgraph->nodes[i + 5];
+                    const ggml_tensor * sgn = (mul_s->src[0] == glu) ? mul_s->src[1] : ((mul_s->src[1] == glu) ? mul_s->src[0] : nullptr);
+                    const int H = (int) fwht_mm->src[0]->ne[0];
+                    if (sgn && sgn->type == GGML_TYPE_F32 && ggml_is_contiguous(sgn) &&
+                            sgn->ne[0] == glu->ne[0] && ggml_nrows(sgn) == 1 &&
+                            rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
+                            (H == 1024 || H == 512 || H == 256 || H == 128) &&
+                            ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                            ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                            ggml_node_get_use_count(cgraph, i + 4) == 1 &&
+                            (glu->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                            (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                            (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                        // Verify fwht_mm feeds a PQ2_0 MUL_MAT (directly or via a single RESHAPE) and nothing else!
+                        int j_mm = i + 6;
+                        const ggml_tensor * cur_t = fwht_mm;
+                        while (j_mm < cgraph->n_nodes && cgraph->nodes[j_mm]->op == GGML_OP_RESHAPE &&
+                                cgraph->nodes[j_mm]->src[0] == cur_t && ggml_node_get_use_count(cgraph, j_mm - 1) == 1) {
+                            cur_t = cgraph->nodes[j_mm];
+                            ++j_mm;
+                        }
+                        if (j_mm < cgraph->n_nodes && cgraph->nodes[j_mm]->op == GGML_OP_MUL_MAT &&
+                                cgraph->nodes[j_mm]->src[1] == cur_t &&
+                                cgraph->nodes[j_mm]->src[0]->type == GGML_TYPE_PQ2_0 &&
+                                ggml_node_get_use_count(cgraph, j_mm - 1) == 1) {
+                            fwht_signs  = sgn;
+                            fwht_out    = fwht_mm;
+                            fwht_H      = H;
+                            extra_fused = 3; // also consume mul_s, rsh, fwht_mm!
+                        }
+                    }
+                }
+                int j_next = i + 3;
+                while (j_next < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j_next])) {
+                    ++j_next;
+                }
+                const bool direct_b = (extra_fused == 0) && (j_next < cgraph->n_nodes) &&
+                    cgraph->nodes[j_next]->op == GGML_OP_MUL_MAT &&
+                    cgraph->nodes[j_next]->src[1] == glu &&
+                    cgraph->nodes[j_next]->src[0]->type == GGML_TYPE_PQ2_0 &&
+                    ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                    (glu->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+                if (ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu, fwht_signs, fwht_out, fwht_H)) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 3 + ((fwht_signs && fwht_out && fwht_H == 1024 && (glu->ne[0] % 1024) == 0 && (glu->ne[0] >> 10) <= 24) ? extra_fused : 0);
+                    break;
+                }
+                if (ggml_cuda_mul_mat_pq2_cublas_i8_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu, direct_b, fwht_signs, fwht_out, fwht_H)) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 3 + extra_fused;
+                    break;
+                }
+            }
+
+            if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    ggml_get_op_params_i32(glu, 1) == 0 && gate->src[1] == up->src[1] &&
+                    ggml_cuda_mul_mat_pq2_narrow_int8_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu)) {
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+            const bool skip_mmvq_for_narrow_i8 = ggml_cuda_pq2_narrow_int8_enabled() &&
+                src0->type == GGML_TYPE_PQ2_0 && src1->type == GGML_TYPE_F32 &&
+                src1->ne[1] >= 5 && src1->ne[1] <= 64 && src0->ne[1] <= 262144;
+            if (!skip_mmvq_for_narrow_i8 && ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -6254,7 +11207,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_q(up, gate, glu)) {
+            if (!skip_mmvq_for_narrow_i8 && ggml_cuda_should_fuse_mul_mat_q(up, gate, glu)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -6264,6 +11217,118 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
+            }
+        } else if (op == GGML_OP_MUL_MAT && (ggml_cuda_pq2_cublas_i8_enabled() || ggml_cuda_pq2_narrow_int8_enabled()) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD }, { i + 1 })) {
+            static const int fuse_add_mode = []() {
+                const char * v = getenv("GGML_CUDA_PQ2_FUSE_ADD");
+                return v != nullptr ? atoi(v) : 1; // 0=off, 1=7-op or non-RMS 2-op, 2=always 2-op
+            }();
+            const bool next_is_rms = (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_RMS_NORM);
+            if (fuse_add_mode != 0) {
+                int out_nodes[] = { i + 1 };
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                    ggml_tensor * mm  = cgraph->nodes[i];
+                    ggml_tensor * add = cgraph->nodes[i + 1];
+                    const ggml_tensor * res = (add->src[0] == mm) ? add->src[1] : ((add->src[1] == mm) ? add->src[0] : nullptr);
+                    // Try 4-op super-fusion: MUL_MAT + ADD + RMS_NORM + MUL(weight) -> B_i8 cache!
+                    if (res && i + 3 < cgraph->n_nodes &&
+                            cgraph->nodes[i + 2]->op == GGML_OP_RMS_NORM &&
+                            cgraph->nodes[i + 3]->op == GGML_OP_MUL) {
+                        ggml_tensor * rms   = cgraph->nodes[i + 2];
+                        ggml_tensor * mul_w = cgraph->nodes[i + 3];
+                        const ggml_tensor * w = (mul_w->src[0] == rms) ? mul_w->src[1] : ((mul_w->src[1] == rms) ? mul_w->src[0] : nullptr);
+                        if (rms->src[0] == add && w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) &&
+                                w->ne[0] == add->ne[0] && ggml_nrows(w) == 1 &&
+                                rms->type == GGML_TYPE_F32 && mul_w->type == GGML_TYPE_F32 &&
+                                ggml_are_same_shape(add, rms) && ggml_are_same_shape(rms, mul_w) &&
+                                ggml_is_contiguous(add) && ggml_is_contiguous(mul_w) &&
+                                ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                                (rms->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                                (mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                                w->data != add->data && w->data != mul_w->data && add->data != mul_w->data) {
+                            float eps = 0.0f;
+                            memcpy(&eps, rms->op_params, sizeof(float));
+                            // Try 7-op super-fusion: MUL_MAT + ADD + RMS_NORM + MUL(w) + MUL(signs) + RESHAPE + FWHT(1024) -> B_i8!
+                            if (i + 6 < cgraph->n_nodes &&
+                                    cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
+                                    cgraph->nodes[i + 5]->op == GGML_OP_RESHAPE &&
+                                    cgraph->nodes[i + 6]->op == GGML_OP_MUL_MAT &&
+                                    ggml_get_op_params_i32(cgraph->nodes[i + 6], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                                ggml_tensor * mul_s   = cgraph->nodes[i + 4];
+                                ggml_tensor * rsh     = cgraph->nodes[i + 5];
+                                ggml_tensor * fwht_mm = cgraph->nodes[i + 6];
+                                const ggml_tensor * sgn = (mul_s->src[0] == mul_w) ? mul_s->src[1] : ((mul_s->src[1] == mul_w) ? mul_s->src[0] : nullptr);
+                                const int H = (int) fwht_mm->src[0]->ne[0];
+                                if (sgn && sgn->type == GGML_TYPE_F32 && ggml_is_contiguous(sgn) &&
+                                        sgn->ne[0] == add->ne[0] && ggml_nrows(sgn) == 1 && H == 1024 &&
+                                        rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
+                                        ggml_node_get_use_count(cgraph, i + 4) == 1 &&
+                                        ggml_node_get_use_count(cgraph, i + 5) == 1 &&
+                                        (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                                        (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                                    // Check if mul_w has any other consumer besides mul_s (e.g. ssm_alpha/beta!)
+                                    const bool mul_w_only_sgn = (ggml_node_get_use_count(cgraph, i + 3) == 1);
+                                    // Verify all consumers of fwht_mm (through optional RESHAPE) are PQ2_0 MUL_MATs
+                                    bool fwht_only_pq2 = true;
+                                    for (int j = i + 7; j < cgraph->n_nodes && fwht_only_pq2; ++j) {
+                                        const ggml_tensor * cn = cgraph->nodes[j];
+                                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                                            if (cn->src[s] == fwht_mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == fwht_mm)) {
+                                                if (cn->op == GGML_OP_RESHAPE) { continue; }
+                                                if (!(s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0)) {
+                                                    fwht_only_pq2 = false; break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (fwht_only_pq2 && ggml_cuda_mul_mat_pq2_cublas_i8(
+                                            *cuda_ctx, mm->src[0], mm->src[1], add, res, w, eps, mul_w, mul_w_only_sgn, sgn, fwht_mm)) {
+                                        fused_mul_mat_vec = true;
+                                        fused_node_count  = 7;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Only fall back to 4-op fusion if mul_w is NOT followed by Hadamard (otherwise let MUL_MAT+ADD run)
+                            bool all_i8_mm = true;
+                            for (int j = i + 4; j < cgraph->n_nodes && all_i8_mm; ++j) {
+                                const ggml_tensor * cn = cgraph->nodes[j];
+                                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                                    if (cn->src[s] == mul_w) {
+                                        const bool ok_mm = (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] &&
+                                            (cn->src[0]->type == GGML_TYPE_PQ2_0 ||
+                                             (cn->src[0]->type == GGML_TYPE_F32 && cn->src[0]->ne[1] <= 64 &&
+                                              strstr(cn->src[0]->name, "lora") == nullptr)));
+                                        if (!ok_mm) { all_i8_mm = false; break; }
+                                    }
+                                }
+                            }
+                            if (all_i8_mm && ggml_cuda_mul_mat_pq2_cublas_i8(*cuda_ctx, mm->src[0], mm->src[1], add, res, w, eps, mul_w, true)) {
+                                fused_mul_mat_vec = true;
+                                fused_node_count  = 4;
+                                break;
+                            }
+                        }
+                    }
+                    if (fuse_add_mode == 2 || !next_is_rms) {
+                        if (!next_is_rms && res && ggml_cuda_mul_mat_pq2_narrow_int8(*cuda_ctx, mm->src[0], mm->src[1], add, res)) {
+                            fused_mul_mat_vec = true;
+                            fused_node_count  = 2;
+                            break;
+                        }
+                        if (res && ggml_cuda_mul_mat_pq2_prefill_int4(*cuda_ctx, mm->src[0], mm->src[1], add, res)) {
+                            fused_mul_mat_vec = true;
+                            fused_node_count  = 2;
+                            break;
+                        }
+                        if (res && ggml_cuda_mul_mat_pq2_cublas_i8(*cuda_ctx, mm->src[0], mm->src[1], add, res)) {
+                            fused_mul_mat_vec = true;
+                            fused_node_count  = 2;
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -6424,6 +11489,313 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // Lossless Fused Full-Attn Gate: SIGMOID(gate) + MUL(attn_out, sig) + MUL(signs) + RESHAPE + FWHT(1024) -> B_i8!
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+            ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled() &&
+            i + 4 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE &&
+            cgraph->nodes[i + 4]->op == GGML_OP_MUL_MAT &&
+            ggml_get_op_params_i32(cgraph->nodes[i + 4], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        ggml_tensor * sig     = cgraph->nodes[i];
+        ggml_tensor * mul_g   = cgraph->nodes[i + 1];
+        ggml_tensor * mul_s   = cgraph->nodes[i + 2];
+        ggml_tensor * rsh     = cgraph->nodes[i + 3];
+        ggml_tensor * fwht_mm = cgraph->nodes[i + 4];
+        const ggml_tensor * gate = sig->src[0];
+        const ggml_tensor * aout = (mul_g->src[0] == sig) ? mul_g->src[1] : ((mul_g->src[1] == sig) ? mul_g->src[0] : nullptr);
+        const ggml_tensor * sgn  = (mul_s->src[0] == mul_g) ? mul_s->src[1] : ((mul_s->src[1] == mul_g) ? mul_s->src[0] : nullptr);
+        const int H = (int) fwht_mm->src[0]->ne[0];
+        if (gate && aout && sgn && H == 1024 &&
+                gate->type == GGML_TYPE_F32 && aout->type == GGML_TYPE_F32 && sgn->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(gate) && ggml_is_contiguous(aout) && ggml_is_contiguous(sgn) &&
+                ggml_are_same_shape(gate, aout) && sgn->ne[0] == gate->ne[0] && ggml_nrows(sgn) == 1 &&
+                rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
+                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul_g->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            bool fwht_only_pq2 = true;
+            for (int j = i + 5; j < cgraph->n_nodes && fwht_only_pq2; ++j) {
+                const ggml_tensor * cn = cgraph->nodes[j];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (cn->src[s] == fwht_mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == fwht_mm)) {
+                        if (cn->op == GGML_OP_RESHAPE) { continue; }
+                        if (!(s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0)) {
+                            fwht_only_pq2 = false; break;
+                        }
+                    }
+                }
+            }
+            auto it_skip = tl_skipped_gate_cont_i8.find(gate);
+            const bool is_strided = (it_skip != tl_skipped_gate_cont_i8.end());
+            const ggml_tensor * gate_src = is_strided ? it_skip->second : gate;
+            if (fwht_only_pq2 && ggml_cuda_sigmoid_mul_fwht1024_to_i8(
+                    *cuda_ctx, aout, gate_src, sgn, fwht_mm, gate->ne[0], gate->ne[1], is_strided)) {
+                if (is_strided) { tl_skipped_gate_cont_i8.erase(it_skip); }
+                return 4;
+            }
+        }
+    }
+
+    // Lossless Fused GDN build_norm_gated (+ 4D head permute) + FWHT(1024) -> B_i8!
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled() &&
+            i + 6 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 2]->op == GGML_OP_GLU &&
+            cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE) {
+        ggml_tensor * rms = cgraph->nodes[i]; ggml_tensor * mul_w = cgraph->nodes[i + 1];
+        ggml_tensor * glu = cgraph->nodes[i + 2]; ggml_tensor * rsh1 = cgraph->nodes[i + 3];
+        int perm_nk = 1, perm_rep = 1, idx_ms = i + 4;
+        const ggml_tensor * pre_ms = rsh1;
+        bool perm_ok = true;
+        if (i + 10 < cgraph->n_nodes &&
+                cgraph->nodes[i + 4]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 5]->op == GGML_OP_PERMUTE &&
+                cgraph->nodes[i + 6]->op == GGML_OP_CONT && cgraph->nodes[i + 7]->op == GGML_OP_RESHAPE) {
+            ggml_tensor * rsh_p = cgraph->nodes[i + 4]; ggml_tensor * perm = cgraph->nodes[i + 5];
+            ggml_tensor * cont_p = cgraph->nodes[i + 6]; ggml_tensor * rsh_p2 = cgraph->nodes[i + 7];
+            if (rsh_p->src[0] == rsh1 && perm->src[0] == rsh_p && cont_p->src[0] == perm && rsh_p2->src[0] == cont_p &&
+                    rsh_p->ne[0] == 128 && perm->ne[0] == 128 && perm->ne[1] == rsh_p->ne[2] && perm->ne[2] == rsh_p->ne[1] &&
+                    rsh_p->ne[2] > 1 && rsh_p->ne[0] * rsh_p->ne[1] * rsh_p->ne[2] == rsh1->ne[0] &&
+                    ggml_node_get_use_count(cgraph, i + 4) == 1 && ggml_node_get_use_count(cgraph, i + 5) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 6) == 1 && ggml_node_get_use_count(cgraph, i + 7) == 1 &&
+                    (cont_p->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                perm_nk = (int) rsh_p->ne[1]; perm_rep = (int) rsh_p->ne[2]; pre_ms = rsh_p2; idx_ms = i + 8;
+            } else { perm_ok = false; }
+        }
+        if (perm_ok && idx_ms + 2 < cgraph->n_nodes &&
+                cgraph->nodes[idx_ms]->op == GGML_OP_MUL && cgraph->nodes[idx_ms + 1]->op == GGML_OP_RESHAPE &&
+                cgraph->nodes[idx_ms + 2]->op == GGML_OP_MUL_MAT &&
+                ggml_get_op_params_i32(cgraph->nodes[idx_ms + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            ggml_tensor * mul_s = cgraph->nodes[idx_ms]; ggml_tensor * rsh2 = cgraph->nodes[idx_ms + 1];
+            ggml_tensor * fwht_mm = cgraph->nodes[idx_ms + 2];
+            const ggml_tensor * src = rms->src[0];
+            const ggml_tensor * rw  = (mul_w->src[0] == rms) ? mul_w->src[1] : ((mul_w->src[1] == rms) ? mul_w->src[0] : nullptr);
+            const ggml_tensor * z   = (glu->src[1] == mul_w) ? glu->src[0] : nullptr;
+            const ggml_tensor * sgn = (mul_s->src[0] == pre_ms) ? mul_s->src[1] : ((mul_s->src[1] == pre_ms) ? mul_s->src[0] : nullptr);
+            const int H = (int) fwht_mm->src[0]->ne[0];
+            if (src && rw && z && sgn && H == 1024 &&
+                    ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
+                    rms->ne[0] == 128 && src->type == GGML_TYPE_F32 && rw->type == GGML_TYPE_F32 &&
+                    z->type == GGML_TYPE_F32 && sgn->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(src) && ggml_is_contiguous(rw) && ggml_is_contiguous(z) && ggml_is_contiguous(sgn) &&
+                    rw->ne[0] == 128 && ggml_nrows(rw) == 1 && ggml_are_same_shape(src, z) &&
+                    rsh1->src[0] == glu && rsh2->src[0] == mul_s && fwht_mm->src[1] == rsh2 &&
+                    sgn->ne[0] == rsh1->ne[0] && ggml_nrows(sgn) == 1 &&
+                    ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                    ggml_node_get_use_count(cgraph, idx_ms) == 1 && ggml_node_get_use_count(cgraph, idx_ms + 1) == 1 &&
+                    (rms->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                    (glu->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                    (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                bool fwht_only_pq2 = true;
+                for (int j = idx_ms + 3; j < cgraph->n_nodes && fwht_only_pq2; ++j) {
+                    const ggml_tensor * cn = cgraph->nodes[j];
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        if (cn->src[s] == fwht_mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == fwht_mm)) {
+                            if (cn->op == GGML_OP_RESHAPE) { continue; }
+                            if (!(s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0)) {
+                                fwht_only_pq2 = false; break;
+                            }
+                        }
+                    }
+                }
+                float eps = 0.0f; memcpy(&eps, rms->op_params, sizeof(float));
+                if (fwht_only_pq2 && ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
+                        *cuda_ctx, src, rw, eps, z, sgn, fwht_mm, rsh1->ne[0], rsh1->ne[1], perm_nk, perm_rep)) {
+                    return (idx_ms + 2) - i;
+                }
+            }
+        }
+    }
+
+    // 5-op Fused RMS_NORM + MUL(w) + MUL(signs) + RESHAPE + FWHT(1024) -> B_s4 (eliminates ALL 127 RMS_NORM + MUL + FWHT pairs!)
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_pq2_prefill_int4_enabled() &&
+            i + 4 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL &&
+            cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE &&
+            cgraph->nodes[i + 4]->op == GGML_OP_MUL_MAT &&
+            ggml_get_op_params_i32(cgraph->nodes[i + 4], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        ggml_tensor * rms     = cgraph->nodes[i];
+        ggml_tensor * mul_w   = cgraph->nodes[i + 1];
+        ggml_tensor * mul_s   = cgraph->nodes[i + 2];
+        ggml_tensor * rsh     = cgraph->nodes[i + 3];
+        ggml_tensor * fwht_mm = cgraph->nodes[i + 4];
+        const ggml_tensor * x   = rms->src[0];
+        const ggml_tensor * rw  = (mul_w->src[0] == rms)   ? mul_w->src[1] : ((mul_w->src[1] == rms)   ? mul_w->src[0] : nullptr);
+        const ggml_tensor * sgn = (mul_s->src[0] == mul_w) ? mul_s->src[1] : ((mul_s->src[1] == mul_w) ? mul_s->src[0] : nullptr);
+        const int H = (int) fwht_mm->src[0]->ne[0];
+        if (x && rw && sgn && H == 1024 &&
+                x->type == GGML_TYPE_F32 && rw->type == GGML_TYPE_F32 && sgn->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(rw) && ggml_is_contiguous(sgn) &&
+                rw->ne[0] == x->ne[0] && ggml_nrows(rw) == 1 &&
+                sgn->ne[0] == x->ne[0] && ggml_nrows(sgn) == 1 &&
+                x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+                x->ne[1] >= 256 && (x->ne[0] % 1024) == 0 && (x->ne[0] >> 10) <= 24 &&
+                rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
+                ggml_node_get_use_count(cgraph, i) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                (rms->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            bool fwht_only_pq2 = true;
+            int n_pq2 = 0;
+            for (int j = i + 5; j < cgraph->n_nodes && fwht_only_pq2; ++j) {
+                const ggml_tensor * cn = cgraph->nodes[j];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (cn->src[s] == fwht_mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == fwht_mm)) {
+                        if (cn->op == GGML_OP_RESHAPE) { continue; }
+                        if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 65536) {
+                            ++n_pq2;
+                        } else {
+                            fwht_only_pq2 = false; break;
+                        }
+                    }
+                }
+            }
+            if (fwht_only_pq2 && n_pq2 >= 1) {
+                cudaStream_t stream = cuda_ctx->stream();
+                const int64_t M = x->ne[0], N = x->ne[1], s11 = x->nb[1] / sizeof(float);
+                const int64_t N_pad = ((N + 127) / 128) * 128;
+                auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+                const size_t need_b = (size_t) N_pad * (size_t) (M >> 3) * sizeof(uint32_t);
+                const size_t need_s = (size_t) N_pad * sizeof(float);
+                if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+                if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+                const bool need_mw = (ggml_node_get_use_count(cgraph, i + 1) > 1) || ((mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) != 0);
+                float eps = 0.0f; memcpy(&eps, rms->op_params, sizeof(float));
+                const int n_blk = (int) (M >> 10);
+                rms_mul_signs_fwht1024_to_s4_kernel<<<(unsigned) N_pad, (unsigned) (n_blk * 32), 0, stream>>>(
+                    (const float *) x->data, nullptr, nullptr, (const float *) rw->data, eps, (const float *) sgn->data,
+                    need_mw ? (float *) mul_w->data : nullptr, nullptr,
+                    sc.B_i4, sc.B_scales, (int) M, (int) N, (int) N_pad, s11, ggml_cuda_pq2_prefill_int4_clip());
+                CUDA_CHECK(cudaGetLastError());
+                sc.src1_data = fwht_mm->data; sc.src1_nbytes = ggml_nbytes(fwht_mm);
+                sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true;
+                return 4;
+            }
+        }
+    }
+
+    // Fused MUL(Hadamard signs) -> RESHAPE -> MUL_MAT(HADAMARD) -> [RESHAPE] -> PQ2_0 MUL_MAT into B_s4, narrow_i8, or B_i8 cache!
+    if (node->op == GGML_OP_MUL && (ggml_cuda_pq2_narrow_int8_enabled() || (ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled())) &&
+            i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT &&
+            ggml_get_op_params_i32(cgraph->nodes[i + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        ggml_tensor * mul_s   = node;
+        ggml_tensor * rsh     = cgraph->nodes[i + 1];
+        ggml_tensor * fwht_mm = cgraph->nodes[i + 2];
+        const ggml_tensor * x   = mul_s->src[0];
+        const ggml_tensor * sgn = mul_s->src[1];
+        const int H = (int) fwht_mm->src[0]->ne[0];
+        if (x && sgn && x->type == GGML_TYPE_F32 && sgn->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(sgn) && sgn->ne[0] == x->ne[0] && ggml_nrows(sgn) == 1 &&
+                x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+                ((x->ne[1] >= 5 && x->ne[1] <= pq2_narrow_i8_max_n() && H == 1024 && ggml_cuda_pq2_narrow_int8_enabled()) ||
+                 (x->ne[1] >= 129 && (H == 1024 || H == 512 || H == 256 || H == 128))) &&
+                (x->ne[0] % H) == 0 && (H == 1024 ? (x->ne[0] / 1024) <= 18 : (x->ne[0] / H) <= 36) &&
+                rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
+                ggml_node_get_use_count(cgraph, i) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            // Verify ALL consumers of fwht_mm (directly or via RESHAPE) are PQ2_0 MUL_MATs (allows multi-consumer like attn_qkv + attn_gate!)
+            bool fwht_only_pq2 = true;
+            int n_pq2_consumers = 0;
+            for (int j = i + 3; j < cgraph->n_nodes && fwht_only_pq2; ++j) {
+                const ggml_tensor * cn = cgraph->nodes[j];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (cn->src[s] == fwht_mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == fwht_mm)) {
+                        if (cn->op == GGML_OP_RESHAPE) { continue; }
+                        if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0) {
+                            ++n_pq2_consumers;
+                        } else {
+                            fwht_only_pq2 = false; break;
+                        }
+                    }
+                }
+            }
+            if (fwht_only_pq2 && n_pq2_consumers >= 1) {
+                cudaStream_t stream = cuda_ctx->stream();
+                const int64_t M = x->ne[0];
+                const int64_t N = x->ne[1];
+                const int64_t s11 = x->nb[1] / sizeof(float);
+                if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n() && H == 1024 && (M >> 10) <= 24) {
+                    auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
+                    const int64_t N_pad = pq2_narrow_i8_n_pad(N);
+                    if (pq2_narrow_i8_alloc_bufs(sc, N_pad, M, stream)) {
+                        const int n_blk = (int) (M >> 10);
+                        mul_signs_fwht1024_to_narrow_i8_kernel<<<(unsigned) N_pad, (unsigned) (n_blk * 32), 0, stream>>>(
+                            (const float *) x->data, (const float *) sgn->data,
+                            sc.B_i8, sc.B_sum, sc.B_scales, (int) M, (int) N, (int) N_pad, s11);
+                        CUDA_CHECK(cudaGetLastError());
+                        sc.src1_data = fwht_mm->data; sc.src1_nbytes = ggml_nbytes(fwht_mm);
+                        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
+                        return 2;
+                    }
+                }
+                if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256 && H == 1024 && (M >> 10) <= 24) {
+                    auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
+                    const int64_t N_pad = ((N + 127) / 128) * 128;
+                    const size_t need_b = (size_t) N_pad * (size_t) (M >> 3) * sizeof(uint32_t);
+                    const size_t need_s = (size_t) N_pad * sizeof(float);
+                    if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+                    if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+                    const int n_blk = (int) (M >> 10);
+                    mul_signs_fwht1024_to_s4_kernel<<<(unsigned) N_pad, (unsigned) (n_blk * 32), 0, stream>>>(
+                        (const float *) x->data, (const float *) sgn->data, sc.B_i4, sc.B_scales,
+                        (int) M, (int) N, (int) N_pad, s11, ggml_cuda_pq2_prefill_int4_clip());
+                    CUDA_CHECK(cudaGetLastError());
+                    sc.src1_data   = fwht_mm->data;
+                    sc.src1_nbytes = ggml_nbytes(fwht_mm);
+                    sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true;
+                    return 2;
+                }
+                if (ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled() && !(ggml_cuda_pq2_prefill_int4_enabled() && N >= 256)) {
+                auto & st = pq2_b_i8_cache_for_stream(stream);
+                const int64_t N_pad = (N + 3) & ~int64_t(3);
+                const size_t need_b = (size_t) N_pad * (size_t) M;
+                const size_t need_s = (size_t) N_pad * sizeof(float);
+                if (st.B_i8_cap < need_b) {
+                    if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+                    CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+                    st.B_i8_cap = need_b;
+                }
+                if (st.col_scales_cap < need_s) {
+                    if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+                    CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+                    st.col_scales_cap = need_s;
+                }
+                if (H == 1024) {
+                    mul_signs_fwht1024_to_i8_kernel<<<(unsigned) N, 512, 0, stream>>>(
+                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                } else if (H == 512) {
+                    mul_signs_fwht_to_i8_kernel<512><<<(unsigned) N, 512, 0, stream>>>(
+                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                } else if (H == 256) {
+                    mul_signs_fwht_to_i8_kernel<256><<<(unsigned) N, 256, 0, stream>>>(
+                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                } else {
+                    mul_signs_fwht_to_i8_kernel<128><<<(unsigned) N, 128, 0, stream>>>(
+                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                st.src1_data   = fwht_mm->data;
+                st.src1_nbytes = ggml_nbytes(fwht_mm);
+                st.N           = N;
+                st.K           = M;
+                st.s11         = M;
+                st.valid       = true;
+                return 2; // consumed mul_s, rsh, fwht_mm!
+                }
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -6550,7 +11922,8 @@ struct ggml_cuda_op_timing {
         rec r = { next_event(), nullptr, GGML_TYPE_COUNT, 0, 0, 0, false };
         CUDA_CHECK(cudaEventRecord(r.ev, stream));
         recs.push_back(r);
-        if (++n_graphs < 100) {
+        static const int report_n = getenv("GGML_CUDA_OP_TIMING_N") ? atoi(getenv("GGML_CUDA_OP_TIMING_N")) : 100;
+        if (++n_graphs < report_n) {
             return;
         }
         CUDA_CHECK(cudaEventSynchronize(r.ev));
@@ -6579,11 +11952,12 @@ struct ggml_cuda_op_timing {
         }
         std::vector<std::pair<std::string, acc>> v(totals.begin(), totals.end());
         std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.ms > y.second.ms; });
-        GGML_LOG_WARN("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
+        fprintf(stderr, "op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
         for (size_t k = 0; k < v.size() && k < 30; ++k) {
-            GGML_LOG_WARN("  %8.3f ms/graph %6.1f%%  x%-7.1f %s\n", v[k].second.ms / n_graphs,
+            fprintf(stderr, "  %8.3f ms/graph %6.1f%%  x%-7.1f %s\n", v[k].second.ms / n_graphs,
                 100.0 * v[k].second.ms / ms_graphs, (double) v[k].second.n / n_graphs, v[k].first.c_str());
         }
+        fflush(stderr);
         recs.clear();
         n_graphs = 0;
     }
@@ -6751,6 +12125,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_gathers().reset();
             cuda_ctx->fwht_q8().reset();
             cuda_ctx->gdn_conv().reset();
+            pq2_b_i8_cache_invalidate(cuda_ctx->stream());
+            pq2_narrow_i8_cache_invalidate(cuda_ctx->stream());
+            pq2_prefill_i4_cache_invalidate(cuda_ctx->stream());
 
 
             // GGML_CUDA_OP_TIMING=1: see ggml_cuda_op_timing
@@ -6810,6 +12187,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
+                }
+
+                if (is_concurrent_event_active) {
+                    pq2_b_i8_cache_invalidate(cuda_ctx->stream());
+                    pq2_narrow_i8_cache_invalidate(cuda_ctx->stream());
+                    pq2_prefill_i4_cache_invalidate(cuda_ctx->stream());
+                } else {
+                    if (node->op != GGML_OP_MUL_MAT || !node->src[0] || node->src[0]->type != GGML_TYPE_PQ2_0) {
+                        pq2_narrow_i8_cache_invalidate_if_overlap(cuda_ctx->stream(), node->data, ggml_nbytes(node));
+                        pq2_b_i8_cache_invalidate_if_overlap(cuda_ctx->stream(), node->data, ggml_nbytes(node));
+                        pq2_prefill_i4_cache_invalidate_if_overlap(cuda_ctx->stream(), node->data, ggml_nbytes(node));
+                    }
                 }
 
                 if (timing) {
@@ -6910,9 +12299,53 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                // Skip full-attn gate CONT when our lossless SIGMOID+MUL+FWHT(1024)->B_i8 will read strided Qcur_full directly!
+                if (node->op == GGML_OP_CONT && ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled() &&
+                        node->type == GGML_TYPE_F32 && node->ne[0] == 6144 && node->ne[1] >= 129 &&
+                        node->src[0] && node->src[0]->op == GGML_OP_VIEW && node->src[0]->view_src &&
+                        node->src[0]->ne[0] == 256 && node->src[0]->ne[1] == 24 && node->src[0]->ne[2] == node->ne[1] &&
+                        node->src[0]->nb[0] == 4 && node->src[0]->nb[1] == 2048 && node->src[0]->view_offs == 1024 &&
+                        ggml_node_get_use_count(cgraph, i) == 1 && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                    const ggml_tensor * qfull = node->src[0]->view_src;
+                    bool can_skip = false;
+                    for (int j = i + 1; j + 4 < cgraph->n_nodes && j <= i + 32; ++j) {
+                        const ggml_tensor * sj = cgraph->nodes[j];
+                        if (sj->op == GGML_OP_UNARY && ggml_get_unary_op(sj) == GGML_UNARY_OP_SIGMOID && sj->src[0] == node &&
+                                cgraph->nodes[j + 1]->op == GGML_OP_MUL &&
+                                cgraph->nodes[j + 2]->op == GGML_OP_MUL &&
+                                cgraph->nodes[j + 3]->op == GGML_OP_RESHAPE &&
+                                cgraph->nodes[j + 4]->op == GGML_OP_MUL_MAT &&
+                                ggml_get_op_params_i32(cgraph->nodes[j + 4], 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                                ggml_node_get_use_count(cgraph, j) == 1 &&
+                                ggml_node_get_use_count(cgraph, j + 1) == 1 &&
+                                ggml_node_get_use_count(cgraph, j + 2) == 1 &&
+                                ggml_node_get_use_count(cgraph, j + 3) == 1) {
+                            can_skip = true;
+                            for (int k = i + 1; k < j; ++k) {
+                                const ggml_tensor * tk = cgraph->nodes[k];
+                                if (!ggml_cuda_is_view_or_noop(tk) && tk->data == qfull->data) {
+                                    can_skip = false; break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (can_skip) {
+                        tl_skipped_gate_cont_i8[node] = qfull;
+                        continue;
+                    }
+                }
+
+                const uint64_t ni8_gen_before = pq2_narrow_i8_scratch_for_stream(cuda_ctx->stream()).gen;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    const auto & ni8_post = pq2_narrow_i8_scratch_for_stream(cuda_ctx->stream());
+                    if (ni8_post.gen == ni8_gen_before) {
+                        for (int f = 1; f <= nodes_to_skip; ++f) {
+                            pq2_narrow_i8_cache_invalidate_if_overlap(cuda_ctx->stream(), cgraph->nodes[i + f]->data, ggml_nbytes(cgraph->nodes[i + f]));
+                        }
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -7122,6 +12555,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
+        // Pre-warm PQ2_0 narrow INT8 repack cache & scratch buffers BEFORE CUDA graph capture
+        // so large weights (e.g. lm_head 248320x5120 on -np 8) never miss during capture.
+        if (ggml_cuda_pq2_narrow_int8_enabled() && turing_mma_available(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            cudaStream_t st = cuda_ctx->stream();
+            auto & sc_pre = pq2_narrow_i8_scratch_for_stream(st);
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * nd = cgraph->nodes[i];
+                if (nd->op == GGML_OP_MUL_MAT && nd->src[0] && nd->src[1] &&
+                        nd->src[0]->type == GGML_TYPE_PQ2_0 && nd->src[1]->type == GGML_TYPE_F32 &&
+                        nd->src[0]->ne[2] == 1 && nd->src[0]->ne[3] == 1 &&
+                        nd->src[1]->ne[2] == 1 && nd->src[1]->ne[3] == 1 &&
+                        nd->src[1]->ne[1] >= 5 && nd->src[1]->ne[1] <= pq2_narrow_i8_max_n() &&
+                        nd->src[0]->ne[1] <= (nd->src[1]->ne[1] >= 256 ? 65536 : 262144) && (nd->src[0]->ne[0] % 128) == 0 && (nd->src[0]->ne[1] % 8) == 0 &&
+                        ggml_is_contiguous(nd->src[0]) &&
+                        ggml_backend_buffer_get_usage(nd->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                    (void) get_or_repack_pq2_tc_i8((const block_pq2_0 *) nd->src[0]->data, nd->src[0]->ne[1], nd->src[0]->ne[0], st, true);
+                    (void) pq2_narrow_i8_alloc_bufs(sc_pre, pq2_narrow_i8_n_pad(nd->src[1]->ne[1]), nd->src[0]->ne[0], st);
+                }
+            }
+        }
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -8284,6 +13737,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+#ifdef GGML_USE_MUSA
+            return false;
+#else
+            return op->src[2] != NULL && op->src[3] != NULL &&
+                   op->src[2]->ne[0] == 128 && op->src[3]->ne[0] == 1;
+#endif
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -8555,6 +14015,84 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     }
 
     return &reg;
+}
+
+__global__ static void cuda_argmax_f32_rows_kernel(
+        const float * __restrict__ logits, int32_t * __restrict__ out_ids, const int n_vocab) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float * src = logits + (int64_t) row * n_vocab;
+
+    float best_v = -INFINITY;
+    int   best_i = 0;
+    const int n4 = n_vocab >> 2;
+    const float4 * src4 = (const float4 *) src;
+    for (int i = tid; i < n4; i += 256) {
+        const float4 v = src4[i];
+        const int base = i << 2;
+        if (v.x > best_v || (v.x == best_v && base + 0 < best_i)) { best_v = v.x; best_i = base + 0; }
+        if (v.y > best_v || (v.y == best_v && base + 1 < best_i)) { best_v = v.y; best_i = base + 1; }
+        if (v.z > best_v || (v.z == best_v && base + 2 < best_i)) { best_v = v.z; best_i = base + 2; }
+        if (v.w > best_v || (v.w == best_v && base + 3 < best_i)) { best_v = v.w; best_i = base + 3; }
+    }
+    for (int i = (n4 << 2) + tid; i < n_vocab; i += 256) {
+        const float v = src[i];
+        if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+    }
+
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFF, best_v, off);
+        const int   oi = __shfl_xor_sync(0xFFFFFFFF, best_i, off);
+        if (ov > best_v || (ov == best_v && oi < best_i)) { best_v = ov; best_i = oi; }
+    }
+    __shared__ float sv[8];
+    __shared__ int   si[8];
+    if ((tid & 31) == 0) {
+        sv[tid >> 5] = best_v;
+        si[tid >> 5] = best_i;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float bv = sv[0];
+        int   bi = si[0];
+#pragma unroll
+        for (int w = 1; w < 8; ++w) {
+            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
+        }
+        out_ids[row] = bi;
+    }
+}
+
+bool ggml_backend_cuda_argmax_f32_rows_async(
+        ggml_backend_t backend, const struct ggml_tensor * t_logits,
+        int32_t * host_ids, int64_t n_rows, int64_t n_vocab) {
+    if (!backend || !t_logits || !host_ids || n_rows <= 0 || n_vocab <= 0) { return false; }
+    if (!ggml_backend_is_cuda(backend)) { return false; }
+    if (t_logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_logits) || !t_logits->data) { return false; }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = ctx->stream();
+
+    struct argmax_buf { int32_t * d_ids = nullptr; int64_t cap = 0; };
+    static std::mutex mu;
+    static std::unordered_map<cudaStream_t, argmax_buf> map;
+    argmax_buf * ab = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ab = &map[stream];
+    }
+    if (ab->cap < n_rows) {
+        const int64_t alloc_n = std::max<int64_t>(n_rows, 2048);
+        if (ab->d_ids) { CUDA_CHECK(cudaFree(ab->d_ids)); }
+        CUDA_CHECK(cudaMalloc(&ab->d_ids, (size_t) alloc_n * sizeof(int32_t)));
+        ab->cap = alloc_n;
+    }
+    cuda_argmax_f32_rows_kernel<<<(unsigned) n_rows, 256, 0, stream>>>(
+        (const float *) t_logits->data, ab->d_ids, (int) n_vocab);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(host_ids, ab->d_ids, (size_t) n_rows * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    return true;
 }
 
 ggml_backend_t ggml_backend_cuda_init(int device) {

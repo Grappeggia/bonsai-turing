@@ -457,22 +457,25 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
     }
 
     if (s_rpl_ctrl) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_rows->buffer));
         GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_ctrl->buffer));
         GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_wrow->buffer));
-        int32_t * rows = (int32_t *) s_rpl_rows->data;
         int32_t * ctrl = (int32_t *) s_rpl_ctrl->data;
         int64_t * wrow = (int64_t *) s_rpl_wrow->data;
 
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            rows[i] = mctx_cur->rpl_row(i);
+        if (s_rpl_rows->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_rows->buffer));
+            int32_t * rows = (int32_t *) s_rpl_rows->data;
+            for (uint32_t i = 0; i < n_rs; ++i) {
+                rows[i] = mctx_cur->rpl_row(i);
+            }
         }
         for (uint32_t i = 0; i < ubatch->n_seqs; ++i) {
             int32_t n_rec = 0;
             int32_t bank  = 0;
             mctx_cur->rpl_take(i, ubatch->n_seq_tokens, n_rec, bank);
+            const int32_t row_i = mctx_cur->rpl_row(i);
             ctrl[2*i + 0] = n_rec;
-            ctrl[2*i + 1] = bank;
+            ctrl[2*i + 1] = ubatch->n_seqs == 1 ? bank : ((row_i << 1) | (bank & 1));
             wrow[i]       = bank ^ 1;
         }
     }
@@ -512,6 +515,13 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
     if (s_rpl_ctrl) {
         res &= s_rpl_rows->ne[0] == mctx_cur->get_n_rs();
         res &= s_rpl_ctrl->ne[0] == 2 * params.ubatch.n_seqs;
+        bool cur_id = (mctx_cur->get_n_rs() == params.ubatch.n_seqs && params.ubatch.n_seqs > 1);
+        for (uint32_t i = 0; cur_id && i < params.ubatch.n_seqs; ++i) {
+            if (mctx_cur->rpl_row(i) != (int32_t) (mctx_cur->get_head() + i)) {
+                cur_id = false;
+            }
+        }
+        res &= (rpl_identity == cur_id);
     }
 
     return res;
@@ -4071,6 +4081,14 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_rpl_ctrl);
         inp->s_rpl_wrow = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_seqs);
         ggml_set_input(inp->s_rpl_wrow);
+
+        bool is_id = (n_rs == n_seqs && n_seqs > 1);
+        for (int64_t i = 0; is_id && i < n_seqs; ++i) {
+            if (mctx_cur->rpl_row((uint32_t) i) != (int32_t) (mctx_cur->get_head() + i)) {
+                is_id = false;
+            }
+        }
+        inp->rpl_identity = is_id;
     }
 
     inp->head = mctx_cur->get_head();

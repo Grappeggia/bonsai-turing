@@ -27,6 +27,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 //
 // llama_context
@@ -1108,8 +1111,44 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+void llama_context::materialize_deferred_logits() {
+    if (!logits_deferred) {
+        return;
+    }
+    logits_deferred = false;
+    if (logits.data && logits_deferred_backend && logits_deferred_tensor && logits_deferred_nbytes > 0) {
+        ggml_backend_tensor_get(logits_deferred_tensor, logits.data, 0, logits_deferred_nbytes);
+        const uint64_t n_vocab = model.vocab.n_tokens();
+        for (size_t s = 0; s < logits_deferred_swaps.size(); ++s) {
+            const uint64_t i0 = logits_deferred_swaps[s].i0;
+            const uint64_t i1 = logits_deferred_swaps[s].i1;
+            for (uint64_t k = 0; k < n_vocab; ++k) {
+                std::swap(logits.data[i0 * n_vocab + k], logits.data[i1 * n_vocab + k]);
+            }
+        }
+    }
+    logits_deferred_swaps.clear();
+}
+
+llama_token llama_context::get_gpu_argmax_ith(int32_t i) {
+    if (!gpu_argmax_valid) {
+        return LLAMA_TOKEN_NULL;
+    }
+    output_reorder();
+    try {
+        const int64_t j = output_resolve_row(i);
+        if (j < 0 || (size_t) j >= gpu_argmax_ids.size()) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return gpu_argmax_ids[j];
+    } catch (...) {
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
 float * llama_context::get_logits() {
     output_reorder();
+    materialize_deferred_logits();
 
     return logits.data;
 }
@@ -1145,6 +1184,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
+    materialize_deferred_logits();
 
     try {
         if (logits.data == nullptr) {
@@ -1540,8 +1580,9 @@ int32_t llama_context::mtp_chain_support() const {
     return 1 | (draft_head ? 2 : 0);
 }
 
-void llama_context::set_mtp_chain(uint32_t n_steps) {
-    cparams.mtp_chain_n = n_steps;
+void llama_context::set_mtp_chain(uint32_t n_steps, uint32_t n_seqs) {
+    cparams.mtp_chain_n     = n_steps;
+    cparams.mtp_chain_n_seq = n_steps > 0 ? std::max<uint32_t>(1, n_seqs) : 1;
     if (n_steps == 0) {
         return;  // keeps the last chain's ids readable
     }
@@ -1552,16 +1593,14 @@ void llama_context::set_mtp_chain(uint32_t n_steps) {
     }
     mtp_chain_embd_tried = true;
 
-    if ((mtp_chain_support() & 2) == 0) {
-        LLAMA_LOG_INFO("%s: MTP chain: no draft head, in-graph tokens use the host token_embd lookup\n", __func__);
-        return;
+    const auto & layer = model.layers[model.hparams.n_layer()];
+    const bool has_draft_head = (mtp_chain_support() & 2) != 0;
+    if (has_draft_head) {
+        ggml_tensor * ids = layer.nextn.draft_head_ids;
+        GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_n_dims(ids) == 1);
+        mtp_chain_vocab.resize(ids->ne[0]);
+        ggml_backend_tensor_get(ids, mtp_chain_vocab.data(), 0, ggml_nbytes(ids));
     }
-
-    const auto &  layer = model.layers[model.hparams.n_layer()];
-    ggml_tensor * ids   = layer.nextn.draft_head_ids;
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_n_dims(ids) == 1);
-    mtp_chain_vocab.resize(ids->ne[0]);
-    ggml_backend_tensor_get(ids, mtp_chain_vocab.data(), 0, ggml_nbytes(ids));
 
     const char * env_gpu = getenv("LLAMA_MTP_CHAIN_GPU_EMBD");
     if (env_gpu && atoi(env_gpu) == 0) {
@@ -1572,12 +1611,19 @@ void llama_context::set_mtp_chain(uint32_t n_steps) {
     ggml_tensor *            src = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     const ggml_backend_dev_t dev = model.dev_layer(model.hparams.n_layer());
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
-        (src->type != GGML_TYPE_PTQ1_0 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32)) {
+        (src->type != GGML_TYPE_PQ2_0 && src->type != GGML_TYPE_PTQ1_0 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32)) {
         LLAMA_LOG_INFO("%s: MTP chain: no device copy of token_embd (%s), host lookups\n", __func__, ggml_type_name(src->type));
         return;
     }
 
-    const int64_t n_rows = ids->ne[0];
+    int64_t n_rows = 0;
+    if (has_draft_head) {
+        n_rows = layer.nextn.draft_head_ids->ne[0];
+    } else {
+        const char * v = getenv("LLAMA_MTP_DRAFT_VOCAB");
+        const int64_t dv = v ? atoll(v) : 0;
+        n_rows = (dv > 0 && dv < src->ne[1]) ? dv : src->ne[1];
+    }
     const size_t  row    = ggml_row_size(src->type, src->ne[0]);
     GGML_ASSERT(src->nb[1] == row);
 
@@ -1598,27 +1644,32 @@ void llama_context::set_mtp_chain(uint32_t n_steps) {
     // a weight to the scheduler: ops reading it run on its device (no copy of the table per graph)
     ggml_backend_buffer_set_usage(mtp_chain_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // row k of the copy = token_embd row of draft-head index k, bytes unchanged (same quantization, same latent basis)
     std::vector<uint8_t> staging((size_t) n_rows * row);
-    for (int64_t k = 0; k < n_rows; ++k) {
-        const int32_t id = mtp_chain_vocab[k];
-        GGML_ASSERT(id >= 0 && id < src->ne[1]);
-        ggml_backend_tensor_get(src, staging.data() + (size_t) k * row, (size_t) id * src->nb[1], row);
+    if (has_draft_head) {
+        // row k of the copy = token_embd row of draft-head index k, bytes unchanged (same quantization, same latent basis)
+        for (int64_t k = 0; k < n_rows; ++k) {
+            const int32_t id = mtp_chain_vocab[k];
+            GGML_ASSERT(id >= 0 && id < src->ne[1]);
+            ggml_backend_tensor_get(src, staging.data() + (size_t) k * row, (size_t) id * src->nb[1], row);
+        }
+    } else {
+        ggml_backend_tensor_get(src, staging.data(), 0, staging.size());
     }
     ggml_backend_tensor_set(t, staging.data(), 0, staging.size());
     mtp_chain_embd = t;
 
-    LLAMA_LOG_INFO("%s: MTP chain: %lld draft-vocab token_embd rows (%s, %.1f MiB) on %s\n", __func__, (long long) n_rows,
+    LLAMA_LOG_INFO("%s: MTP chain: %lld %s token_embd rows (%s, %.1f MiB) on %s\n", __func__, (long long) n_rows,
+            has_draft_head ? "draft-vocab" : "GPU-resident",
             ggml_type_name(src->type), staging.size() / 1048576.0, ggml_backend_dev_name(dev));
 }
 
 llama_context::mtp_chain_entry * llama_context::mtp_chain_entry_for(uint32_t n_tokens) {
-    const uint32_t key = (cparams.mtp_chain_n << 16) | n_tokens;
+    const uint32_t key = (cparams.mtp_chain_n << 20) | ((cparams.mtp_chain_n_seq & 0xFF) << 12) | (n_tokens & 0xFFF);
     auto it = mtp_chain_cache.find(key);
     if (it != mtp_chain_cache.end()) {
         return &it->second;
     }
-    if (mtp_chain_cache.size() >= 16) {  // shapes are catch-up rows (1..n_max+1) + steps: a handful in practice
+    if (mtp_chain_cache.size() >= 16) {  // shapes are catch-up rows + steps * seqs
         synchronize();
         mtp_chain_cache.clear();
     }
@@ -1966,7 +2017,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         mtp_chain_rs.build_ms   += (t_cs1 - t_cs0) / 1000.0;
         mtp_chain_rs.set_ms     += (t_cs2 - t_cs1) / 1000.0;
         mtp_chain_rs.compute_ms += (t_cs3 - t_cs2) / 1000.0;
-        if (++mtp_chain_rs.n == 64) {
+        static const int report_every = getenv("LLAMA_SRV_TIMING") ? 16 : 64;
+        if (++mtp_chain_rs.n == report_every) {
             mtp_chain_rs.report();
         }
     }
@@ -2237,6 +2289,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    gpu_argmax_valid        = false;
+    logits_deferred         = false;
+    logits_deferred_backend = nullptr;
+    logits_deferred_tensor  = nullptr;
+    logits_deferred_nbytes  = 0;
+    logits_deferred_swaps.clear();
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2302,10 +2360,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
-    // ARC-LAB: a chained MTP draft is one graph over the whole batch (catch-up rows, anchor, one row per later step)
-    if (cparams.mtp_chain_n > 0 && (n_tokens_all > cparams.n_ubatch || n_tokens_all < cparams.mtp_chain_n)) {
-        LLAMA_LOG_ERROR("%s: MTP chain of %u steps needs %u..%u tokens in one ubatch, got %u\n", __func__,
-                cparams.mtp_chain_n, cparams.mtp_chain_n, cparams.n_ubatch, n_tokens_all);
+    // ARC-LAB: a chained MTP draft is one graph over the whole batch (catch-up rows, anchors, one row per seq per later step)
+    const uint32_t mtp_min_toks = cparams.mtp_chain_n * cparams.mtp_chain_n_seq;
+    if (cparams.mtp_chain_n > 0 && (n_tokens_all > cparams.n_ubatch || n_tokens_all < mtp_min_toks)) {
+        LLAMA_LOG_ERROR("%s: MTP chain of %u steps x %u seqs needs %u..%u tokens in one ubatch, got %u\n", __func__,
+                cparams.mtp_chain_n, cparams.mtp_chain_n_seq, mtp_min_toks, cparams.n_ubatch, n_tokens_all);
         return -1;
     }
 
@@ -2464,23 +2523,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         if (chain_e) {
             // the per-step argmax rows, mapped to tokens in get_mtp_chain_ids()
+            const uint32_t n_seq_c = std::max<uint32_t>(1, cparams.mtp_chain_n_seq);
             if (res && res->t_mtp_chain_ids) {
                 // one copy of all the ids (LLAMA_MTP_CHAIN_TIGHT bit 16)
                 ggml_tensor *  t = res->t_mtp_chain_ids;
                 ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-                GGML_ASSERT(b != nullptr && t->ne[0] == (int64_t) res->t_mtp_chain.size());
-                mtp_chain_out.resize(res->t_mtp_chain.size());
-                ggml_backend_tensor_get_async(b, t, mtp_chain_out.data(), 0, mtp_chain_out.size() * sizeof(int32_t));
-                mtp_chain_n_out = (uint32_t) res->t_mtp_chain.size();
+                const uint32_t n_tot = (uint32_t) res->t_mtp_chain.size() * n_seq_c;
+                GGML_ASSERT(b != nullptr && t->ne[0] == (int64_t) n_tot);
+                mtp_chain_out.resize(n_tot);
+                ggml_backend_tensor_get_async(b, t, mtp_chain_out.data(), 0, n_tot * sizeof(int32_t));
+                mtp_chain_n_out = n_tot;
             } else if (res && !res->t_mtp_chain.empty()) {
-                mtp_chain_out.resize(res->t_mtp_chain.size());
+                const uint32_t n_tot = (uint32_t) res->t_mtp_chain.size() * n_seq_c;
+                mtp_chain_out.resize(n_tot);
                 for (size_t s = 0; s < res->t_mtp_chain.size(); ++s) {
                     ggml_tensor *  t = res->t_mtp_chain[s];
                     ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
                     GGML_ASSERT(b != nullptr);
-                    ggml_backend_tensor_get_async(b, t, &mtp_chain_out[s], 0, sizeof(int32_t));
+                    ggml_backend_tensor_get_async(b, t, &mtp_chain_out[s * n_seq_c], 0, n_seq_c * sizeof(int32_t));
                 }
-                mtp_chain_n_out = (uint32_t) res->t_mtp_chain.size();
+                mtp_chain_n_out = n_tot;
             }
             std::swap(sched,       chain_e->sched);
             std::swap(gf_res_prev, chain_e->res);
@@ -2561,7 +2623,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                bool did_gpu_argmax = false;
+#ifndef _WIN32
+                static const bool enable_gpu_argmax = []() {
+                    const char * e = getenv("LLAMA_GPU_GREEDY_ARGMAX");
+                    return !e || atoi(e) != 0;
+                }();
+                if (enable_gpu_argmax && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+                        n_outputs_prev == 0 && n_outputs == n_outputs_all && n_outputs >= 2 &&
+                        t_logits->type == GGML_TYPE_F32 && sampling.samplers.empty()) {
+                    using fn_t = bool (*)(ggml_backend_t, const struct ggml_tensor *, int32_t *, int64_t, int64_t);
+                    static fn_t fn = (fn_t) dlsym(RTLD_DEFAULT, "ggml_backend_cuda_argmax_f32_rows_async");
+                    if (fn) {
+                        gpu_argmax_ids.resize((size_t) n_outputs);
+                        if (fn(backend_res, t_logits, gpu_argmax_ids.data(), n_outputs, n_vocab)) {
+                            gpu_argmax_valid        = true;
+                            logits_deferred         = true;
+                            logits_deferred_backend = backend_res;
+                            logits_deferred_tensor  = t_logits;
+                            logits_deferred_nbytes  = (size_t) n_outputs * (size_t) n_vocab * sizeof(float);
+                            did_gpu_argmax          = true;
+                        }
+                    }
+                }
+#endif
+                if (!did_gpu_argmax) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -2953,10 +3041,18 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        if (logits.size > 0 && !logits_deferred) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
+        }
+
+        if (gpu_argmax_valid && i0 < gpu_argmax_ids.size() && i1 < gpu_argmax_ids.size()) {
+            std::swap(gpu_argmax_ids[i0], gpu_argmax_ids[i1]);
+        }
+
+        if (logits_deferred) {
+            logits_deferred_swaps.push_back(output_swaps[s]);
         }
 
         if (embd.size > 0) {
@@ -4788,6 +4884,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     return res;
 }
 
+llama_token llama_get_gpu_argmax_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_gpu_argmax_ith(i);
+}
+
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 
@@ -4823,7 +4925,11 @@ int32_t llama_mtp_chain_support(const llama_context * ctx) {
 }
 
 void llama_set_mtp_chain(llama_context * ctx, int32_t n_steps) {
-    ctx->set_mtp_chain(n_steps > 0 ? (uint32_t) n_steps : 0u);
+    ctx->set_mtp_chain(n_steps > 0 ? (uint32_t) n_steps : 0u, 1u);
+}
+
+void llama_set_mtp_chain_seqs(llama_context * ctx, int32_t n_steps, int32_t n_seqs) {
+    ctx->set_mtp_chain(n_steps > 0 ? (uint32_t) n_steps : 0u, n_seqs > 0 ? (uint32_t) n_seqs : 1u);
 }
 
 const llama_token * llama_get_mtp_chain_ids(llama_context * ctx) {

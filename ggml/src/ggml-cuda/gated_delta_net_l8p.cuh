@@ -49,7 +49,7 @@ __global__ void __launch_bounds__(32 * NW, 1) gated_delta_net_l8p_cuda(
         int64_t sb1, int64_t sb2, int64_t sb3,
         const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_slot_stride, int K,
         const int32_t * s_ids, int64_t s_row_stride, const int sab) {
-#    if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#    if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     using SM = gdn_l8p_smem<T, NW, CPL>;
     constexpr int S_v  = 128;
     constexpr int NCOL = SM::NCOL;
@@ -102,23 +102,40 @@ __global__ void __launch_bounds__(32 * NW, 1) gated_delta_net_l8p_cuda(
             const int     pi = ((ii / 32) * 8 + ii % 8) * 4 + (ii % 32) / 8;
             const float * ks = k_base + (int64_t) t0 * sq2 + ii;
             const float * qs = q_base + (int64_t) t0 * sq2 + ii;
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
             unsigned int  d  = (unsigned int) __cvta_generic_to_shared(&buf[pi]);
             for (int t = 0; t < cnt; ++t) {
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(d), "l"(ks));
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(d + 4 * S_v), "l"(qs));
                 ks += sq2; qs += sq2; d += 4 * SM::TOK;
             }
+#        else
+            for (int t = 0; t < cnt; ++t) {
+                buf[t * SM::TOK + pi]       = *ks;
+                buf[t * SM::TOK + S_v + pi] = *qs;
+                ks += sq2; qs += sq2;
+            }
+#        endif
         }
         for (int i = tid; i < NCOL + 2; i += 32 * NW) {
             const float * src = i < NCOL ? v_base + (int64_t) t0 * sv2 + i : (i == NCOL ? g : beta) + gb_base + (int64_t) t0 * sb2;
             const int64_t st  = i < NCOL ? sv2 : sb2;
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
             unsigned int  d   = (unsigned int) __cvta_generic_to_shared(&buf[2 * S_v + i]);
             for (int t = 0; t < cnt; ++t) {
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(d), "l"(src));
                 src += st; d += 4 * SM::TOK;
             }
+#        else
+            for (int t = 0; t < cnt; ++t) {
+                buf[t * SM::TOK + 2 * S_v + i] = *src;
+                src += st;
+            }
+#        endif
         }
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
         asm volatile("cp.async.commit_group;");
+#        endif
     };
 
     issue(0);
@@ -136,6 +153,7 @@ __global__ void __launch_bounds__(32 * NW, 1) gated_delta_net_l8p_cuda(
     }
 
     for (int ch = 0; ch < n_chunks; ++ch) {
+#        if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
         if (ch + 1 < n_chunks && !(sab & 2)) {   // sab bit 1: timing probe, no staging after chunk 0 (wrong output)
             issue(ch + 1);
             asm volatile("cp.async.wait_group 1;");
@@ -143,6 +161,12 @@ __global__ void __launch_bounds__(32 * NW, 1) gated_delta_net_l8p_cuda(
             asm volatile("cp.async.wait_group 0;");
         }
         __syncthreads();
+#        else
+        __syncthreads();
+        if (ch + 1 < n_chunks && !(sab & 2)) {
+            issue(ch + 1);
+        }
+#        endif
 
         const float * buf = l8p_sm + (ch & 1) * SM::BUF;
         const int     t0  = ch * T;
