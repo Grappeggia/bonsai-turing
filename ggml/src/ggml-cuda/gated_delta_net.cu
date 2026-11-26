@@ -765,6 +765,124 @@ __global__ void gdn_replay_seq_cuda(
     curr_state += state_in_offset + col * S_v;
     float * attn_data = dst + ((int64_t) sequence * n_tokens * H + h_idx) * S_v;
 
+    // Fast 128-bit float4 coalesced + ILP-batched path for S_v == 128, warp_size == 32, cols_per_warp == 4 (Turing+!)
+    if constexpr (S_v == 128 && warp_size == 32 && cols_per_warp == 4) {
+        const int r4 = lane * 4;
+        float4 s4[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            s4[c] = *(const float4 *) (curr_state + c * 128 + r4);
+        }
+
+        if (rec_in != nullptr) {
+            const int32_t n_rec     = ctrl[2 * sequence + 0];
+            const int32_t bank_cell = ctrl[2 * sequence + 1];
+            const int32_t rec_cell  = (n_seqs == 1) ? 0 : (bank_cell >> 1);
+            const int32_t bank      = bank_cell & 1;
+            const float * rb        = rec_in + (int64_t) rec_cell * rec_in_seq_stride + (int64_t) bank * rec_in_bank_stride;
+            for (int32_t j = 0; j < n_rec; ++j) {
+                const float * rj    = rb + (int64_t) j * em.R;
+                const float   g_val = rj[2 * H * 128 + h_idx];
+                const float4  kr    = *(const float4 *) (rj + H * 128 + h_idx * 128 + r4);
+                const float4  d4    = *(const float4 *) (rj + h_idx * 128 + col);
+                const float   dc[4] = { d4.x, d4.y, d4.z, d4.w };
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    s4[c].x = fmaf(kr.x, dc[c], g_val * s4[c].x);
+                    s4[c].y = fmaf(kr.y, dc[c], g_val * s4[c].y);
+                    s4[c].z = fmaf(kr.z, dc[c], g_val * s4[c].z);
+                    s4[c].w = fmaf(kr.w, dc[c], g_val * s4[c].w);
+                }
+            }
+        }
+
+        float * base_out = em.base ? em.base + ((int64_t) sequence * H + h_idx) * (128 * 128) + col * 128 : nullptr;
+        float * rec_seq  = em.rec ? em.rec + (em.rec_rows ? em.rec_rows[sequence] : (int64_t) sequence) * em.rec_row_stride
+                                  : nullptr;
+
+        if (em.t_base < 0 && base_out) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                *(float4 *) (base_out + c * 128 + r4) = s4[c];
+            }
+        }
+
+        for (int t = 0; t < n_tokens; ++t) {
+            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+            const float   beta_val  = beta[gb_offset];
+            const float   g_val     = __expf(g[gb_offset]);
+
+            const float4 qr = *(const float4 *) (q_t + r4);
+            const float4 kr = *(const float4 *) (k_t + r4);
+            const float4 vr = *(const float4 *) (v_t + col);
+
+            // Compute all 4 kv dot products in parallel, then interleave all 4 warp reductions (4x ILP!)
+            float kv0 = fmaf(s4[0].x, kr.x, fmaf(s4[0].y, kr.y, fmaf(s4[0].z, kr.z, s4[0].w * kr.w)));
+            float kv1 = fmaf(s4[1].x, kr.x, fmaf(s4[1].y, kr.y, fmaf(s4[1].z, kr.z, s4[1].w * kr.w)));
+            float kv2 = fmaf(s4[2].x, kr.x, fmaf(s4[2].y, kr.y, fmaf(s4[2].z, kr.z, s4[2].w * kr.w)));
+            float kv3 = fmaf(s4[3].x, kr.x, fmaf(s4[3].y, kr.y, fmaf(s4[3].z, kr.z, s4[3].w * kr.w)));
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                kv0 += __shfl_xor_sync(0xFFFFFFFF, kv0, off);
+                kv1 += __shfl_xor_sync(0xFFFFFFFF, kv1, off);
+                kv2 += __shfl_xor_sync(0xFFFFFFFF, kv2, off);
+                kv3 += __shfl_xor_sync(0xFFFFFFFF, kv3, off);
+            }
+            const float dc[4] = {
+                (vr.x - g_val * kv0) * beta_val,
+                (vr.y - g_val * kv1) * beta_val,
+                (vr.z - g_val * kv2) * beta_val,
+                (vr.w - g_val * kv3) * beta_val,
+            };
+
+            float ap[4];
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                s4[c].x = fmaf(kr.x, dc[c], g_val * s4[c].x);
+                s4[c].y = fmaf(kr.y, dc[c], g_val * s4[c].y);
+                s4[c].z = fmaf(kr.z, dc[c], g_val * s4[c].z);
+                s4[c].w = fmaf(kr.w, dc[c], g_val * s4[c].w);
+                ap[c]   = fmaf(s4[c].x, qr.x, fmaf(s4[c].y, qr.y, fmaf(s4[c].z, qr.z, s4[c].w * qr.w)));
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                ap[0] += __shfl_xor_sync(0xFFFFFFFF, ap[0], off);
+                ap[1] += __shfl_xor_sync(0xFFFFFFFF, ap[1], off);
+                ap[2] += __shfl_xor_sync(0xFFFFFFFF, ap[2], off);
+                ap[3] += __shfl_xor_sync(0xFFFFFFFF, ap[3], off);
+            }
+            if (lane == 0) {
+                *(float4 *) (attn_data + col) = make_float4(ap[0] * scale, ap[1] * scale, ap[2] * scale, ap[3] * scale);
+            }
+            attn_data += 128 * H;
+
+            if (t == em.t_base) {
+                if (base_out) {
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        *(float4 *) (base_out + c * 128 + r4) = s4[c];
+                    }
+                }
+            } else if (t > em.t_base && rec_seq) {
+                float * rt = rec_seq + (int64_t) (t - em.t_base - 1) * em.R;
+                if (lane == 0) {
+                    *(float4 *) (rt + h_idx * 128 + col) = make_float4(dc[0], dc[1], dc[2], dc[3]);
+                }
+                if (col == 0) {
+                    *(float4 *) (rt + H * 128 + h_idx * 128 + r4) = kr;
+                    if (lane == 0) {
+                        rt[2 * H * 128 + h_idx] = g_val;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     float s_shard[cols_per_warp][rows_per_lane];
 #pragma unroll
     for (int c = 0; c < cols_per_warp; ++c) {
@@ -916,15 +1034,19 @@ static void launch_gdn_replay_seq(
         s_ids, s_row_stride, rec_in, rec_in_seq_stride, rec_in_bank_stride, ctrl, em);
 }
 
+struct gdn_wrow_ptrs {
+    const int64_t * p[ggml_cuda_gdn_replay_fused::MAX_BATCH_SEQS];
+};
+
 __global__ static void gdn_set_rows_batched_cuda(
         const float * __restrict__ src,
         float * __restrict__ dst_base,
-        const int64_t * __restrict__ wrows,
+        const gdn_wrow_ptrs wrows,
         const int64_t n_elems,
         const int64_t cell_stride,
         const int64_t bank_stride) {
     const int64_t si   = blockIdx.y;
-    const int64_t bank = wrows[si];
+    const int64_t bank = wrows.p[si][0];
     const float * s    = src + si * bank_stride;
     float *       d    = dst_base + si * cell_stride + bank * bank_stride;
     const int64_t stride = (int64_t) gridDim.x * blockDim.x;
@@ -1051,12 +1173,15 @@ void ggml_cuda_op_gated_delta_net_replay(
         sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
         s_ids, s_row_stride, rec_d, rec_in_seq_stride, rec_in_bank_stride, ctrl, em, stream);
 
-    if (fused && fused->rec_batch_dst && fused->rec_batch_wrows && n_seqs > 1 && K > 1) {
+    if (fused && fused->rec_batch_dst && fused->rec_batch_n_seqs == n_seqs && n_seqs > 1 &&
+            n_seqs <= ggml_cuda_gdn_replay_fused::MAX_BATCH_SEQS && K > 1) {
         const int64_t n_elems = R * (K - 1);
         const int blocks_x = (int) std::min<int64_t>(32, ((n_elems >> 2) + 255) / 256);
         dim3 grid(std::max(1, blocks_x), (unsigned) n_seqs, 1);
+        gdn_wrow_ptrs wp{};
+        for (int i = 0; i < n_seqs; ++i) { wp.p[i] = fused->rec_batch_wrows[i]; }
         gdn_set_rows_batched_cuda<<<grid, 256, 0, stream>>>(
-            em.rec, fused->rec_batch_dst, fused->rec_batch_wrows,
+            em.rec, fused->rec_batch_dst, wp,
             n_elems, fused->rec_batch_cell_stride, fused->rec_batch_bank_stride);
     }
 }

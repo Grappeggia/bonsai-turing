@@ -652,6 +652,44 @@ static __global__ void cpy_f32_batched(const ggml_cuda_cpy_batch batch, const in
     *(float *) (batch.dst[blockIdx.y] + dst_offset) = *(const float *) (batch.src[blockIdx.y] + x_offset);
 }
 
+static __global__ void cpy_f32_batched_conv3_fast(
+        const ggml_cuda_cpy_batch batch, const int n, const int C, const int stride,
+        const int64_t nb01, const int64_t nb02, const int64_t nb11) {
+    constexpr int CH_BLK = 64;
+    const int ch0  = (int) blockIdx.x * CH_BLK;
+    const int seq  = (int) blockIdx.y;
+    const int ch_n = min(CH_BLK, C - ch0);
+    if (ch_n <= 0) { return; }
+    const int tid = (int) threadIdx.x;
+    const int W   = n + 2;
+
+    __shared__ float sm[CH_BLK][36];
+    const float * src_base = (const float *) (batch.src[0] + (int64_t) seq * nb02 + (int64_t) ch0 * nb01);
+    const int tot_in = ch_n * stride;
+    for (int i = tid; i < tot_in; i += 256) {
+        const float v = src_base[i];
+        const int c = i / stride;
+        const int k = i - c * stride;
+        if (k < W) { sm[c][k] = v; }
+    }
+    __syncthreads();
+
+    const int n_f4 = (ch_n * 3) >> 2;
+    const int tot_f4 = n * n_f4;
+    for (int idx = tid; idx < tot_f4; idx += 256) {
+        const int b  = idx / n_f4;
+        const int f4 = idx - b * n_f4;
+        const int e0 = f4 << 2;
+        const int c0 = e0 / 3, o0 = e0 - c0 * 3;
+        const int c1 = (o0 == 2) ? (c0 + 1) : c0, o1 = (o0 == 2) ? 0 : (o0 + 1);
+        const int c2 = (o1 == 2) ? (c1 + 1) : c1, o2 = (o1 == 2) ? 0 : (o1 + 1);
+        const int c3 = (o2 == 2) ? (c2 + 1) : c2, o3 = (o2 == 2) ? 0 : (o2 + 1);
+        const float4 out = make_float4(sm[c0][b + o0], sm[c1][b + o1], sm[c2][b + o2], sm[c3][b + o3]);
+        float4 * d4 = (float4 *) ((float *) (batch.dst[b] + (int64_t) seq * nb11) + ch0 * 3);
+        d4[f4] = out;
+    }
+}
+
 static __global__ void cpy_f32_batched_conv3(
         const ggml_cuda_cpy_batch batch, const int n, const int C,
         const int64_t nb01, const int64_t nb02, const int64_t nb11) {
@@ -680,9 +718,24 @@ void ggml_cuda_cpy_f32_batched(ggml_backend_cuda_context & ctx, const ggml_tenso
             src_ref->nb[0] == sizeof(float) && dst_ref->nb[0] == sizeof(float) &&
             dst_ref->ne[0] == 3 * src_ref->ne[1] && dst_ref->ne[1] == src_ref->ne[2]) {
         const int C = (int) src_ref->ne[1];
+        const int64_t nb01 = (int64_t) src_ref->nb[1];
+        const int64_t nb02 = (int64_t) src_ref->nb[2];
+        const int64_t nb11 = (int64_t) dst_ref->nb[1];
+        const int stride = (int) (nb01 >> 2);
+        bool is_sliding = (n >= 2 && (C % 4) == 0 && (nb01 % 4) == 0 && (nb02 % 4) == 0 && (nb11 % 16) == 0 &&
+                stride >= n + 2 && stride <= 36 && ((uintptr_t) batch.dst[0] & 15) == 0);
+        for (int b = 1; is_sliding && b < n; ++b) {
+            if (batch.src[b] != batch.src[0] + (size_t) b * sizeof(float) || ((uintptr_t) batch.dst[b] & 15) != 0) {
+                is_sliding = false;
+            }
+        }
+        if (is_sliding) {
+            const dim3 grid((unsigned) ((C + 63) / 64), (unsigned) src_ref->ne[2], 1);
+            cpy_f32_batched_conv3_fast<<<grid, 256, 0, ctx.stream()>>>(batch, n, C, stride, nb01, nb02, nb11);
+            return;
+        }
         const dim3 grid((unsigned) ((C + 255) / 256), (unsigned) src_ref->ne[2], 1);
-        cpy_f32_batched_conv3<<<grid, 256, 0, ctx.stream()>>>(
-            batch, n, C, (int64_t) src_ref->nb[1], (int64_t) src_ref->nb[2], (int64_t) dst_ref->nb[1]);
+        cpy_f32_batched_conv3<<<grid, 256, 0, ctx.stream()>>>(batch, n, C, nb01, nb02, nb11);
         return;
     }
 

@@ -17,13 +17,15 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
 
 // fused-kernel replay output: base -> plane 0, records -> bank rec_rows[seq] (when rec != nullptr)
 struct ggml_cuda_gdn_replay_fused {
+    static constexpr int MAX_BATCH_SEQS = 64;
     float *         base                  = nullptr;
     float *         rec                   = nullptr;
     const int64_t * rec_rows              = nullptr;
     int64_t         rec_row_stride        = 0;
     // Batched post-replay SET_ROWS for n_seqs > 1 (100% cell-swap safe):
     float *         rec_batch_dst         = nullptr;
-    const int64_t * rec_batch_wrows       = nullptr;
+    const int64_t * rec_batch_wrows[MAX_BATCH_SEQS] = {};
+    int             rec_batch_n_seqs      = 0;
     int64_t         rec_batch_cell_stride = 0;
     int64_t         rec_batch_bank_stride = 0;
 };

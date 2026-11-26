@@ -1770,9 +1770,10 @@ static pq2_tc_i8_entry get_or_repack_pq2_tc_i8(
         const block_pq2_0 * src0, const int64_t M, const int64_t K, cudaStream_t stream, bool allow_alloc) {
     static std::mutex mu;
     static std::unordered_map<const void *, pq2_tc_i8_entry> cache;
+    static std::vector<pq2_tc_i8_entry> retired;
     std::lock_guard<std::mutex> lock(mu);
     auto it = cache.find(src0);
-    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+    if (it != cache.end() && it->second.M >= M && it->second.K == K) {
         return it->second;
     }
     if (!allow_alloc) {
@@ -1780,13 +1781,29 @@ static pq2_tc_i8_entry get_or_repack_pq2_tc_i8(
     }
     const int64_t n_rg   = (M + 7) >> 3;
     const int64_t n_kblk = K >> 7;
+    const size_t  need_qs = (size_t) n_rg * (size_t) n_kblk * 32 * sizeof(uint2);
+    const size_t  need_d  = (size_t) n_rg * (size_t) n_kblk * 8  * sizeof(half);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need_qs + need_d + (2ULL << 30)) {
+        return {};
+    }
     pq2_tc_i8_entry e;
     e.M = M; e.K = K;
-    CUDA_CHECK(cudaMalloc(&e.qs, (size_t) n_rg * (size_t) n_kblk * 32 * sizeof(uint2)));
-    CUDA_CHECK(cudaMalloc(&e.d,  (size_t) n_rg * (size_t) n_kblk * 8  * sizeof(half)));
+    if (cudaMalloc(&e.qs, need_qs) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return {};
+    }
+    if (cudaMalloc(&e.d, need_d) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaFree(e.qs);
+        return {};
+    }
     dim3 grid((unsigned) n_rg, (unsigned) n_kblk);
     repack_pq2_to_tc_i8_kernel<<<grid, 32, 0, stream>>>(src0, e.qs, e.d, (int) M, (int) K);
     CUDA_CHECK(cudaGetLastError());
+    if (it != cache.end()) {
+        retired.push_back(it->second);
+    }
     cache[src0] = e;
     return e;
 }
@@ -2714,23 +2731,35 @@ static pq2_s4_rm_entry get_or_repack_pq2_s4_rm(
         const block_pq2_0 * src0, const int64_t M, const int64_t K, cudaStream_t stream, bool allow_alloc) {
     static std::mutex mu;
     static std::unordered_map<const void *, pq2_s4_rm_entry> cache;
+    static std::vector<pq2_s4_rm_entry> retired;
     std::lock_guard<std::mutex> lock(mu);
     auto it = cache.find(src0);
-    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+    if (it != cache.end() && it->second.M >= M && it->second.K == K) {
         return it->second;
     }
     if (!allow_alloc) { return {}; }
-    pq2_s4_rm_entry e;
-    e.M = M; e.K = K;
-    if (cudaMalloc(&e.qs, (size_t) M * (size_t) (K >> 1)) != cudaSuccess) {
+    const size_t need_qs = (size_t) M * (size_t) (K >> 1);
+    const size_t need_d  = (size_t) M * sizeof(float);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need_qs + need_d + (3584ULL << 20)) {
         return {};
     }
-    if (cudaMalloc(&e.d, (size_t) M * sizeof(float)) != cudaSuccess) {
+    pq2_s4_rm_entry e;
+    e.M = M; e.K = K;
+    if (cudaMalloc(&e.qs, need_qs) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return {};
+    }
+    if (cudaMalloc(&e.d, need_d) != cudaSuccess) {
+        (void) cudaGetLastError();
         cudaFree(e.qs);
         return {};
     }
     repack_pq2_to_s4_rm_kernel<<<(unsigned) M, 256, 0, stream>>>(src0, (uint32_t *) e.qs, e.d, (int) M, (int) K);
     CUDA_CHECK(cudaGetLastError());
+    if (it != cache.end()) {
+        retired.push_back(it->second);
+    }
     cache[src0] = e;
     return e;
 }
@@ -3062,8 +3091,17 @@ static bool ggml_cuda_mul_mat_pq2_prefill_int4(
     (void) cudaStreamIsCapturing(stream, &cap_status);
     const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
 
-    const auto ae = get_or_repack_pq2_s4_rm((const block_pq2_0 *) src0->data, M, K, stream, allow_alloc);
-    if (!ae.qs || !ae.d) { return false; }
+    auto ae = get_or_repack_pq2_s4_rm((const block_pq2_0 *) src0->data, M, K, stream, allow_alloc);
+    ggml_cuda_pool_alloc<uint8_t> tmp_qs(ctx.pool());
+    ggml_cuda_pool_alloc<float>   tmp_d(ctx.pool());
+    if (!ae.qs || !ae.d) {
+        tmp_qs.alloc((size_t) M * (size_t) (K >> 1));
+        tmp_d.alloc((size_t) M);
+        repack_pq2_to_s4_rm_kernel<<<(unsigned) M, 256, 0, stream>>>(
+            (const block_pq2_0 *) src0->data, (uint32_t *) tmp_qs.get(), tmp_d.get(), (int) M, (int) K);
+        ae.qs = tmp_qs.get();
+        ae.d  = tmp_d.get();
+    }
 
     const int64_t N_pad = ((N + 127) / 128) * 128;
     const int64_t s11   = src1->nb[1] / sizeof(float);
@@ -3213,9 +3251,26 @@ static bool ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(
     (void) cudaStreamIsCapturing(stream, &cap_status);
     const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
 
-    const auto ge = get_or_repack_pq2_s4_rm((const block_pq2_0 *) gate_w->data, M, K, stream, allow_alloc);
-    const auto ue = get_or_repack_pq2_s4_rm((const block_pq2_0 *) up_w->data,   M, K, stream, allow_alloc);
-    if (!ge.qs || !ge.d || !ue.qs || !ue.d) { return false; }
+    auto ge = get_or_repack_pq2_s4_rm((const block_pq2_0 *) gate_w->data, M, K, stream, allow_alloc);
+    auto ue = get_or_repack_pq2_s4_rm((const block_pq2_0 *) up_w->data,   M, K, stream, allow_alloc);
+    ggml_cuda_pool_alloc<uint8_t> tmp_g_qs(ctx.pool());
+    ggml_cuda_pool_alloc<float>   tmp_g_d(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> tmp_u_qs(ctx.pool());
+    ggml_cuda_pool_alloc<float>   tmp_u_d(ctx.pool());
+    if (!ge.qs || !ge.d) {
+        tmp_g_qs.alloc((size_t) M * (size_t) (K >> 1));
+        tmp_g_d.alloc((size_t) M);
+        repack_pq2_to_s4_rm_kernel<<<(unsigned) M, 256, 0, stream>>>(
+            (const block_pq2_0 *) gate_w->data, (uint32_t *) tmp_g_qs.get(), tmp_g_d.get(), (int) M, (int) K);
+        ge.qs = tmp_g_qs.get(); ge.d = tmp_g_d.get();
+    }
+    if (!ue.qs || !ue.d) {
+        tmp_u_qs.alloc((size_t) M * (size_t) (K >> 1));
+        tmp_u_d.alloc((size_t) M);
+        repack_pq2_to_s4_rm_kernel<<<(unsigned) M, 256, 0, stream>>>(
+            (const block_pq2_0 *) up_w->data, (uint32_t *) tmp_u_qs.get(), tmp_u_d.get(), (int) M, (int) K);
+        ue.qs = tmp_u_qs.get(); ue.d = tmp_u_d.get();
+    }
 
     const int64_t N_pad = ((N + 127) / 128) * 128;
     const int64_t s11   = src1->nb[1] / sizeof(float);
@@ -3913,6 +3968,27 @@ static bool ggml_cuda_mul_mat_pq2_narrow_int8(
             split_k = (M <= 8192) ? 4u : 2u;
         } else if (N <= 64 && M <= 8192) {
             split_k = 2u;
+        } else if (N >= 129 && M <= 12288 && K >= 4096) {
+            // Wave-balanced split-K to eliminate tail-wave SM underutilization on N=129..512
+            const int64_t wave_slots = (int64_t) std::max(1, ggml_cuda_info().devices[ctx.device].nsm) * 2;
+            const int64_t grid_xy = ((M + 127) / 128) * ((N + 63) / 64);
+            const int64_t n_kblk  = K >> 7;
+            auto wave_eff = [&](unsigned sk) -> double {
+                const int64_t tot   = grid_xy * sk;
+                const int64_t waves = (tot + wave_slots - 1) / wave_slots;
+                return (double) tot / (double) (waves * wave_slots);
+            };
+            const double eff1 = wave_eff(1u);
+            double best_eff = eff1;
+            for (unsigned sk : { 2u, 3u }) {
+                if (n_kblk >= (int64_t) (12u * sk)) {
+                    const double e = wave_eff(sk);
+                    if (e > eff1 + 0.12 && e > best_eff + 0.03) {
+                        best_eff = e;
+                        split_k  = sk;
+                    }
+                }
+            }
         }
     }
     if (split_k > 1u) {
@@ -4121,25 +4197,38 @@ static size_t ggml_cuda_pq2_cache_i8_max_bytes() {
 }
 
 static pq2_row_scale_cache_entry get_or_compute_pq2_row_scales(
-        const block_pq2_0 * src0_data, const int64_t M, const int64_t K, cudaStream_t stream) {
+        const block_pq2_0 * src0_data, const int64_t M, const int64_t K, cudaStream_t stream, bool allow_alloc = true) {
     static std::mutex mu;
     static std::unordered_map<const void *, pq2_row_scale_cache_entry> cache;
+    static std::vector<pq2_row_scale_cache_entry> retired;
     static size_t cached_i8_bytes = 0;
     std::lock_guard<std::mutex> lock(mu);
     auto it = cache.find(src0_data);
-    if (it != cache.end() && it->second.M == M && it->second.K == K) {
+    if (it != cache.end() && it->second.M >= M && it->second.K == K) {
         return it->second;
+    }
+    if (!allow_alloc) {
+        return {};
     }
     pq2_row_scale_cache_entry e{};
     e.M = M;
     e.K = K;
     e.A_i8 = nullptr;
-    CUDA_CHECK(cudaMalloc(&e.scales,     (size_t) M * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&e.inv_scales, (size_t) M * sizeof(float)));
+    if (cudaMalloc(&e.scales, (size_t) M * sizeof(float)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return {};
+    }
+    if (cudaMalloc(&e.inv_scales, (size_t) M * sizeof(float)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaFree(e.scales);
+        return {};
+    }
     compute_pq2_row_scales_kernel<<<(unsigned) M, 256, 0, stream>>>(src0_data, e.scales, e.inv_scales, (int) M, (int) K);
     const size_t need_bytes = (size_t) M * (size_t) K;
     const size_t max_bytes  = ggml_cuda_pq2_cache_i8_max_bytes();
-    if (max_bytes > 0 && cached_i8_bytes + need_bytes <= max_bytes) {
+    size_t free_b = 0, total_b = 0;
+    const bool have_headroom = (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) || (free_b >= need_bytes + (3584ULL << 20));
+    if (max_bytes > 0 && have_headroom && cached_i8_bytes + need_bytes <= max_bytes) {
         int8_t * ptr = nullptr;
         if (cudaMalloc(&ptr, need_bytes) == cudaSuccess) {
             const int nkb = (int) (K / QK_PQ2_0);
@@ -4150,6 +4239,9 @@ static pq2_row_scale_cache_entry get_or_compute_pq2_row_scales(
         } else {
             (void) cudaGetLastError();
         }
+    }
+    if (it != cache.end()) {
+        retired.push_back(it->second);
     }
     cache[src0_data] = e;
     return e;
@@ -4265,13 +4357,16 @@ struct thin_f32_i8_cache_entry {
 };
 
 static thin_f32_i8_cache_entry get_or_quantize_thin_f32(
-        const float * src0_data, const int64_t M, const int64_t K, cudaStream_t stream) {
+        const float * src0_data, const int64_t M, const int64_t K, cudaStream_t stream, bool allow_alloc = true) {
     static std::mutex mu;
     static std::unordered_map<const void *, thin_f32_i8_cache_entry> cache;
     std::lock_guard<std::mutex> lock(mu);
     auto it = cache.find(src0_data);
     if (it != cache.end() && it->second.M == M && it->second.K == K) {
         return it->second;
+    }
+    if (!allow_alloc) {
+        return {};
     }
     thin_f32_i8_cache_entry e{};
     e.M = M;
@@ -5750,8 +5845,18 @@ static bool ggml_cuda_mul_mat_pq2_cublas_i8(
 
     const int64_t N_pad = (N + 3) & ~int64_t(3);
     cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap_status);
+    const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
 
-    const auto rs_entry = get_or_compute_pq2_row_scales((const block_pq2_0 *) src0->data, M, K, stream);
+    const auto rs_entry = get_or_compute_pq2_row_scales((const block_pq2_0 *) src0->data, M, K, stream, allow_alloc);
+    if (!rs_entry.scales || !rs_entry.inv_scales) {
+        return false;
+    }
+    auto & b_st = pq2_b_i8_cache_for_stream(stream);
+    if (!allow_alloc && (b_st.B_i8_cap < (size_t) N_pad * (size_t) K || b_st.col_scales_cap < (size_t) N_pad * sizeof(float))) {
+        return false;
+    }
     ggml_cuda_pool_alloc<int8_t> A_i8_tmp(ctx.pool());
     int8_t * A_i8_ptr = rs_entry.A_i8;
     if (A_i8_ptr == nullptr) {
@@ -5887,9 +5992,19 @@ static bool ggml_cuda_mul_mat_pq2_cublas_i8_swiglu(
 
     const int64_t N_pad = (N + 3) & ~int64_t(3);
     cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    (void) cudaStreamIsCapturing(stream, &cap_status);
+    const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
 
-    const auto gate_rs = get_or_compute_pq2_row_scales((const block_pq2_0 *) gate_w->data, M, K, stream);
-    const auto up_rs   = get_or_compute_pq2_row_scales((const block_pq2_0 *) up_w->data,   M, K, stream);
+    const auto gate_rs = get_or_compute_pq2_row_scales((const block_pq2_0 *) gate_w->data, M, K, stream, allow_alloc);
+    const auto up_rs   = get_or_compute_pq2_row_scales((const block_pq2_0 *) up_w->data,   M, K, stream, allow_alloc);
+    if (!gate_rs.scales || !gate_rs.inv_scales || !up_rs.scales || !up_rs.inv_scales) {
+        return false;
+    }
+    auto & b_st = pq2_b_i8_cache_for_stream(stream);
+    if (!allow_alloc && (b_st.B_i8_cap < (size_t) N_pad * (size_t) K || b_st.col_scales_cap < (size_t) N_pad * sizeof(float))) {
+        return false;
+    }
 
     ggml_cuda_pool_alloc<int8_t> A_i8_tmp(ctx.pool());
     if (gate_rs.A_i8 == nullptr || up_rs.A_i8 == nullptr) {
@@ -6235,7 +6350,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     if (ggml_cuda_pq2_narrow_int8_enabled() && src0->type == GGML_TYPE_PQ2_0 &&
-            src1->ne[1] >= 5 && src1->ne[1] <= pq2_narrow_i8_max_n() && src0->ne[1] <= 262144) {
+            src1->ne[1] >= 5 && src1->ne[1] <= pq2_narrow_i8_max_n() &&
+            src0->ne[1] <= (src1->ne[1] >= 256 ? 65536 : 262144)) {
         return false;
     }
 
@@ -6555,25 +6671,31 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int64_t K = ne00, M = ne01, N = ne11;
         const int64_t N_pad = (N + 3) & ~int64_t(3);
         cudaStream_t stream = ctx.stream();
-        const auto ae = get_or_quantize_thin_f32((const float *) src0->data, M, K, stream);
-        int8_t * B_i8_ptr = nullptr;
-        float  * col_scales_ptr = nullptr;
-        const int64_t s11 = src1->nb[1] / sizeof(float);
-        get_or_quantize_b_i8(src1, N, N_pad, K, s11, stream, B_i8_ptr, col_scales_ptr);
-        ggml_cuda_pool_alloc<int32_t> C_i32(ctx.pool(), (size_t) M * N_pad);
-        const int32_t alpha_i = 1, beta_i = 0;
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-        CUBLAS_CHECK(cublasGemmEx(
-            ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, (int) M, (int) N_pad, (int) K,
-            &alpha_i, ae.A_i8, CUDA_R_8I, (int) K, B_i8_ptr, CUDA_R_8I, (int) K,
-            &beta_i, C_i32.get(), CUDA_R_32I, (int) M, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        const int64_t s_dst = dst->nb[1] / sizeof(float);
-        const dim3 epi_grid((unsigned) ((M / 4 + 255) / 256), (unsigned) N, 1);
-        dequant_i32_to_f32_epilogue_kernel<<<epi_grid, 256, 0, stream>>>(
-            C_i32.get(), ae.scales, col_scales_ptr, nullptr, (float *) dst->data, (int) M, (int) N, s_dst);
-        pq2_b_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
-        CUDA_CHECK(cudaGetLastError());
-        return;
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        (void) cudaStreamIsCapturing(stream, &cap_status);
+        const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
+        const auto ae = get_or_quantize_thin_f32((const float *) src0->data, M, K, stream, allow_alloc);
+        auto & b_st = pq2_b_i8_cache_for_stream(stream);
+        if (ae.A_i8 != nullptr && (allow_alloc || (b_st.B_i8_cap >= (size_t) N_pad * (size_t) K && b_st.col_scales_cap >= (size_t) N_pad * sizeof(float)))) {
+            int8_t * B_i8_ptr = nullptr;
+            float  * col_scales_ptr = nullptr;
+            const int64_t s11 = src1->nb[1] / sizeof(float);
+            get_or_quantize_b_i8(src1, N, N_pad, K, s11, stream, B_i8_ptr, col_scales_ptr);
+            ggml_cuda_pool_alloc<int32_t> C_i32(ctx.pool(), (size_t) M * N_pad);
+            const int32_t alpha_i = 1, beta_i = 0;
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+            CUBLAS_CHECK(cublasGemmEx(
+                ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, (int) M, (int) N_pad, (int) K,
+                &alpha_i, ae.A_i8, CUDA_R_8I, (int) K, B_i8_ptr, CUDA_R_8I, (int) K,
+                &beta_i, C_i32.get(), CUDA_R_32I, (int) M, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            const int64_t s_dst = dst->nb[1] / sizeof(float);
+            const dim3 epi_grid((unsigned) ((M / 4 + 255) / 256), (unsigned) N, 1);
+            dequant_i32_to_f32_epilogue_kernel<<<epi_grid, 256, 0, stream>>>(
+                C_i32.get(), ae.scales, col_scales_ptr, nullptr, (float *) dst->data, (int) M, (int) N, s_dst);
+            pq2_b_i8_cache_invalidate_if_overlap(stream, dst->data, ggml_nbytes(dst));
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
@@ -8576,6 +8698,10 @@ static int ggml_cuda_try_gdn_replay_fusion(
             continue;
         }
         if (n->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            if (cpy != nullptr) {
+                n_sr_multi = -1;
+                break;
+            }
             return 0;
         }
         if (n->op == GGML_OP_CPY && cpy == nullptr) {
@@ -8586,7 +8712,8 @@ static int ggml_cuda_try_gdn_replay_fusion(
             sr = n;
             skip = j - node_idx;
             break;
-        } else if (!want_sr && cpy != nullptr && n->op == GGML_OP_SET_ROWS && n_sr_multi < n_seqs) {
+        } else if (!want_sr && cpy != nullptr && n->op == GGML_OP_SET_ROWS && n_sr_multi < n_seqs &&
+                   n_seqs <= ggml_cuda_gdn_replay_fused::MAX_BATCH_SEQS) {
             const ggml_tensor * rs = n->src[0];
             const ggml_tensor * ri = n->src[1];
             const int64_t si = n_sr_multi;
@@ -8601,16 +8728,15 @@ static int ggml_cuda_try_gdn_replay_fusion(
                 sr_first = n;
             } else if (ok && si == 1) {
                 sr_cell_stride_bytes = (int64_t) ((const char *) n->data - (const char *) sr_first->data);
-                ok = sr_cell_stride_bytes > 0 && (sr_cell_stride_bytes % (int64_t) sizeof(float)) == 0 &&
-                     ((const char *) ri->data - (const char *) sr_first->src[1]->data) == (int64_t) sizeof(int64_t);
+                ok = sr_cell_stride_bytes > 0 && (sr_cell_stride_bytes % (int64_t) sizeof(float)) == 0;
             } else if (ok && si > 1) {
-                ok = ((const char *) n->data - (const char *) sr_first->data) == si * sr_cell_stride_bytes &&
-                     ((const char *) ri->data - (const char *) sr_first->src[1]->data) == si * (int64_t) sizeof(int64_t);
+                ok = ((const char *) n->data - (const char *) sr_first->data) == si * sr_cell_stride_bytes;
             }
             if (!ok) {
                 n_sr_multi = -1;
                 break;
             }
+            fused.rec_batch_wrows[si] = (const int64_t *) ri->data;
             ++n_sr_multi;
             if (n_sr_multi == n_seqs) {
                 skip = j - node_idx;
@@ -8648,7 +8774,7 @@ static int ggml_cuda_try_gdn_replay_fusion(
         }
     } else if (!want_sr && n_sr_multi == n_seqs && sr_first != nullptr) {
         fused.rec_batch_dst         = (float *) sr_first->data;
-        fused.rec_batch_wrows       = (const int64_t *) sr_first->src[1]->data;
+        fused.rec_batch_n_seqs      = (int) n_seqs;
         fused.rec_batch_cell_stride = sr_cell_stride_bytes / (int64_t) sizeof(float);
         fused.rec_batch_bank_stride = rec_elems;
     } else if (!want_sr) {
@@ -10121,7 +10247,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         for (int s = 0; s < GGML_MAX_SRC; ++s) {
                             if (cn->src[s] == mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == mm)) {
                                 if (cn->op == GGML_OP_RESHAPE) { continue; }
-                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 262144) {
+                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 &&
+                                        cn->src[0]->ne[1] <= (node->ne[1] >= 256 ? 65536 : 262144)) {
                                     ++n_pq2;
                                 } else {
                                     fwht_only_pq2 = false; break;
@@ -10364,7 +10491,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         for (int s = 0; s < GGML_MAX_SRC; ++s) {
                             if (cn->src[s] == mm || (cn->src[s] && cn->src[s]->op == GGML_OP_RESHAPE && cn->src[s]->src[0] == mm)) {
                                 if (cn->op == GGML_OP_RESHAPE) { continue; }
-                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 && cn->src[0]->ne[1] <= 262144) {
+                                if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0 &&
+                                        cn->src[0]->ne[1] <= (x->ne[1] >= 256 ? 65536 : 262144)) {
                                     ++n_pq2;
                                 } else {
                                     safe_ni8 = false; break;
@@ -11312,7 +11440,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         }
                     }
                     if (fuse_add_mode == 2 || !next_is_rms) {
-                        if (!next_is_rms && res && ggml_cuda_mul_mat_pq2_narrow_int8(*cuda_ctx, mm->src[0], mm->src[1], add, res)) {
+                        if ((!next_is_rms || (fuse_add_mode == 2 && mm->src[1]->ne[1] > 32)) && res &&
+                                ggml_cuda_mul_mat_pq2_narrow_int8(*cuda_ctx, mm->src[0], mm->src[1], add, res)) {
                             fused_mul_mat_vec = true;
                             fused_node_count  = 2;
                             break;
@@ -11706,6 +11835,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // Verify ALL consumers of fwht_mm (directly or via RESHAPE) are PQ2_0 MUL_MATs (allows multi-consumer like attn_qkv + attn_gate!)
             bool fwht_only_pq2 = true;
             int n_pq2_consumers = 0;
+            int64_t min_consumer_m = INT64_MAX;
+            int64_t max_consumer_m = 0;
             for (int j = i + 3; j < cgraph->n_nodes && fwht_only_pq2; ++j) {
                 const ggml_tensor * cn = cgraph->nodes[j];
                 for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -11713,6 +11844,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         if (cn->op == GGML_OP_RESHAPE) { continue; }
                         if (s == 1 && cn->op == GGML_OP_MUL_MAT && cn->src[0] && cn->src[0]->type == GGML_TYPE_PQ2_0) {
                             ++n_pq2_consumers;
+                            min_consumer_m = std::min(min_consumer_m, cn->src[0]->ne[1]);
+                            max_consumer_m = std::max(max_consumer_m, cn->src[0]->ne[1]);
                         } else {
                             fwht_only_pq2 = false; break;
                         }
@@ -11721,10 +11854,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             if (fwht_only_pq2 && n_pq2_consumers >= 1) {
                 cudaStream_t stream = cuda_ctx->stream();
+                cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+                (void) cudaStreamIsCapturing(stream, &cap_status);
+                const bool allow_alloc = (cap_status == cudaStreamCaptureStatusNone);
                 const int64_t M = x->ne[0];
                 const int64_t N = x->ne[1];
                 const int64_t s11 = x->nb[1] / sizeof(float);
-                if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n() && H == 1024 && (M >> 10) <= 24) {
+                if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n() &&
+                        max_consumer_m <= (N >= 256 ? 65536 : 262144) && H == 1024 && (M >> 10) <= 24) {
                     auto & sc = pq2_narrow_i8_scratch_for_stream(stream);
                     const int64_t N_pad = pq2_narrow_i8_n_pad(N);
                     if (pq2_narrow_i8_alloc_bufs(sc, N_pad, M, stream)) {
@@ -11738,59 +11875,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         return 2;
                     }
                 }
-                if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256 && H == 1024 && (M >> 10) <= 24) {
+                if (ggml_cuda_pq2_prefill_int4_enabled() && N >= 256 && max_consumer_m <= 65536 && H == 1024 && (M >> 10) <= 24) {
                     auto & sc = pq2_prefill_i4_scratch_for_stream(stream);
                     const int64_t N_pad = ((N + 127) / 128) * 128;
                     const size_t need_b = (size_t) N_pad * (size_t) (M >> 3) * sizeof(uint32_t);
                     const size_t need_s = (size_t) N_pad * sizeof(float);
-                    if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
-                    if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
-                    const int n_blk = (int) (M >> 10);
-                    mul_signs_fwht1024_to_s4_kernel<<<(unsigned) N_pad, (unsigned) (n_blk * 32), 0, stream>>>(
-                        (const float *) x->data, (const float *) sgn->data, sc.B_i4, sc.B_scales,
-                        (int) M, (int) N, (int) N_pad, s11, ggml_cuda_pq2_prefill_int4_clip());
-                    CUDA_CHECK(cudaGetLastError());
-                    sc.src1_data   = fwht_mm->data;
-                    sc.src1_nbytes = ggml_nbytes(fwht_mm);
-                    sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true;
-                    return 2;
+                    if (allow_alloc || (sc.cap_b >= need_b && sc.cap_sc >= need_s)) {
+                        if (sc.cap_b < need_b)  { if (sc.B_i4)     CUDA_CHECK(cudaFree(sc.B_i4));     CUDA_CHECK(cudaMalloc(&sc.B_i4, need_b));     sc.cap_b = need_b; }
+                        if (sc.cap_sc < need_s) { if (sc.B_scales) CUDA_CHECK(cudaFree(sc.B_scales)); CUDA_CHECK(cudaMalloc(&sc.B_scales, need_s)); sc.cap_sc = need_s; }
+                        const int n_blk = (int) (M >> 10);
+                        mul_signs_fwht1024_to_s4_kernel<<<(unsigned) N_pad, (unsigned) (n_blk * 32), 0, stream>>>(
+                            (const float *) x->data, (const float *) sgn->data, sc.B_i4, sc.B_scales,
+                            (int) M, (int) N, (int) N_pad, s11, ggml_cuda_pq2_prefill_int4_clip());
+                        CUDA_CHECK(cudaGetLastError());
+                        sc.src1_data   = fwht_mm->data;
+                        sc.src1_nbytes = ggml_nbytes(fwht_mm);
+                        sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true;
+                        return 2;
+                    }
                 }
-                if (ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled() && !(ggml_cuda_pq2_prefill_int4_enabled() && N >= 256)) {
-                auto & st = pq2_b_i8_cache_for_stream(stream);
-                const int64_t N_pad = (N + 3) & ~int64_t(3);
-                const size_t need_b = (size_t) N_pad * (size_t) M;
-                const size_t need_s = (size_t) N_pad * sizeof(float);
-                if (st.B_i8_cap < need_b) {
-                    if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
-                    CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
-                    st.B_i8_cap = need_b;
-                }
-                if (st.col_scales_cap < need_s) {
-                    if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
-                    CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
-                    st.col_scales_cap = need_s;
-                }
-                if (H == 1024) {
-                    mul_signs_fwht1024_to_i8_kernel<<<(unsigned) N, 512, 0, stream>>>(
-                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
-                } else if (H == 512) {
-                    mul_signs_fwht_to_i8_kernel<512><<<(unsigned) N, 512, 0, stream>>>(
-                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
-                } else if (H == 256) {
-                    mul_signs_fwht_to_i8_kernel<256><<<(unsigned) N, 256, 0, stream>>>(
-                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
-                } else {
-                    mul_signs_fwht_to_i8_kernel<128><<<(unsigned) N, 128, 0, stream>>>(
-                        (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
-                }
-                CUDA_CHECK(cudaGetLastError());
-                st.src1_data   = fwht_mm->data;
-                st.src1_nbytes = ggml_nbytes(fwht_mm);
-                st.N           = N;
-                st.K           = M;
-                st.s11         = M;
-                st.valid       = true;
-                return 2; // consumed mul_s, rsh, fwht_mm!
+                const bool all_consumers_cublas_i8 =
+                    (min_consumer_m > 65536 && N >= 256) ||
+                    (N >= 129 && (!ggml_cuda_pq2_narrow_int8_enabled() || N > pq2_narrow_i8_max_n()) &&
+                     !(ggml_cuda_pq2_prefill_int4_enabled() && N >= 256));
+                if (ggml_cuda_pq2_cublas_i8_enabled() && pq2_b_i8_cache_enabled() && all_consumers_cublas_i8) {
+                    auto & st = pq2_b_i8_cache_for_stream(stream);
+                    const int64_t N_pad = (N + 3) & ~int64_t(3);
+                    const size_t need_b = (size_t) N_pad * (size_t) M;
+                    const size_t need_s = (size_t) N_pad * sizeof(float);
+                    if (allow_alloc || (st.B_i8_cap >= need_b && st.col_scales_cap >= need_s)) {
+                        if (st.B_i8_cap < need_b) {
+                            if (st.B_i8) { CUDA_CHECK(cudaFree(st.B_i8)); }
+                            CUDA_CHECK(cudaMalloc(&st.B_i8, need_b));
+                            st.B_i8_cap = need_b;
+                        }
+                        if (st.col_scales_cap < need_s) {
+                            if (st.col_scales) { CUDA_CHECK(cudaFree(st.col_scales)); }
+                            CUDA_CHECK(cudaMalloc(&st.col_scales, need_s));
+                            st.col_scales_cap = need_s;
+                        }
+                        if (H == 1024) {
+                            mul_signs_fwht1024_to_i8_kernel<<<(unsigned) N, 512, 0, stream>>>(
+                                (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                        } else if (H == 512) {
+                            mul_signs_fwht_to_i8_kernel<512><<<(unsigned) N, 512, 0, stream>>>(
+                                (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                        } else if (H == 256) {
+                            mul_signs_fwht_to_i8_kernel<256><<<(unsigned) N, 256, 0, stream>>>(
+                                (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                        } else {
+                            mul_signs_fwht_to_i8_kernel<128><<<(unsigned) N, 128, 0, stream>>>(
+                                (const float *) x->data, (const float *) sgn->data, st.B_i8, st.col_scales, (int) M, (int) N, s11);
+                        }
+                        CUDA_CHECK(cudaGetLastError());
+                        st.src1_data   = fwht_mm->data;
+                        st.src1_nbytes = ggml_nbytes(fwht_mm);
+                        st.N           = N;
+                        st.K           = M;
+                        st.s11         = M;
+                        st.valid       = true;
+                        return 2; // consumed mul_s, rsh, fwht_mm!
+                    }
                 }
             }
         }
@@ -12555,24 +12700,80 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
-        // Pre-warm PQ2_0 narrow INT8 repack cache & scratch buffers BEFORE CUDA graph capture
-        // so large weights (e.g. lm_head 248320x5120 on -np 8) never miss during capture.
-        if (ggml_cuda_pq2_narrow_int8_enabled() && turing_mma_available(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        // Pre-warm PQ2_0 narrow INT8, prefill INT4, and cuBLAS INT8 caches & scratch buffers BEFORE CUDA graph capture
+        // so cudaMalloc/cudaFuncSetAttribute never execute during capture and large weights (e.g. lm_head) hit cache.
+        if (turing_mma_available(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             cudaStream_t st = cuda_ctx->stream();
-            auto & sc_pre = pq2_narrow_i8_scratch_for_stream(st);
+            const bool en_ni8 = ggml_cuda_pq2_narrow_int8_enabled();
+            const bool en_i4  = ggml_cuda_pq2_prefill_int4_enabled();
+            const bool en_cb  = ggml_cuda_pq2_cublas_i8_enabled();
+            auto & sc_ni8 = pq2_narrow_i8_scratch_for_stream(st);
+            auto & sc_i4  = pq2_prefill_i4_scratch_for_stream(st);
+            auto & sc_cb  = pq2_b_i8_cache_for_stream(st);
+            size_t max_i4_b = 0, max_i4_sc = 0, max_i4_gate = 0;
+            size_t max_cb_b = 0, max_cb_sc = 0;
+            bool need_i4_attr = false;
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * nd = cgraph->nodes[i];
                 if (nd->op == GGML_OP_MUL_MAT && nd->src[0] && nd->src[1] &&
                         nd->src[0]->type == GGML_TYPE_PQ2_0 && nd->src[1]->type == GGML_TYPE_F32 &&
                         nd->src[0]->ne[2] == 1 && nd->src[0]->ne[3] == 1 &&
                         nd->src[1]->ne[2] == 1 && nd->src[1]->ne[3] == 1 &&
-                        nd->src[1]->ne[1] >= 5 && nd->src[1]->ne[1] <= pq2_narrow_i8_max_n() &&
-                        nd->src[0]->ne[1] <= (nd->src[1]->ne[1] >= 256 ? 65536 : 262144) && (nd->src[0]->ne[0] % 128) == 0 && (nd->src[0]->ne[1] % 8) == 0 &&
                         ggml_is_contiguous(nd->src[0]) &&
                         ggml_backend_buffer_get_usage(nd->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-                    (void) get_or_repack_pq2_tc_i8((const block_pq2_0 *) nd->src[0]->data, nd->src[0]->ne[1], nd->src[0]->ne[0], st, true);
-                    (void) pq2_narrow_i8_alloc_bufs(sc_pre, pq2_narrow_i8_n_pad(nd->src[1]->ne[1]), nd->src[0]->ne[0], st);
+                    const int64_t K = nd->src[0]->ne[0], M = nd->src[0]->ne[1], N = nd->src[1]->ne[1];
+                    if (en_ni8 && N >= 5 && N <= pq2_narrow_i8_max_n() &&
+                            M <= (N >= 256 ? 65536 : 262144) && (K % 128) == 0 && (M % 8) == 0) {
+                        (void) get_or_repack_pq2_tc_i8((const block_pq2_0 *) nd->src[0]->data, M, K, st, true);
+                        (void) pq2_narrow_i8_alloc_bufs(sc_ni8, pq2_narrow_i8_n_pad(N), K, st);
+                    } else if (en_i4 && N >= 256 && M <= 65536 && (K % 256) == 0 && (M % 128) == 0) {
+                        (void) get_or_repack_pq2_s4_rm((const block_pq2_0 *) nd->src[0]->data, M, K, st, true);
+                        const int64_t N_pad = ((N + 127) / 128) * 128;
+                        max_i4_b    = std::max(max_i4_b,    (size_t) N_pad * (size_t) (K >> 3) * sizeof(uint32_t));
+                        max_i4_sc   = std::max(max_i4_sc,   (size_t) N_pad * sizeof(float));
+                        max_i4_gate = std::max(max_i4_gate, (size_t) N * (size_t) M * sizeof(half));
+                        need_i4_attr = true;
+                    } else if (en_cb && (K % QK_PQ2_0) == 0 && (M % 4) == 0) {
+                        const int64_t min_n_cb = en_ni8 ? (M > 65536 ? 256 : (pq2_narrow_i8_max_n() + 1)) : 129;
+                        if (N >= min_n_cb) {
+                            (void) get_or_compute_pq2_row_scales((const block_pq2_0 *) nd->src[0]->data, M, K, st, true);
+                            const int64_t N_pad = (N + 3) & ~int64_t(3);
+                            max_cb_b  = std::max(max_cb_b,  (size_t) N_pad * (size_t) K);
+                            max_cb_sc = std::max(max_cb_sc, (size_t) N_pad * sizeof(float));
+                        }
+                    }
                 }
+            }
+            if (need_i4_attr) {
+                CUDA_CHECK(cudaFuncSetAttribute(pq2_prefill_s4_128x128x256_ldm_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+                CUDA_CHECK(cudaFuncSetAttribute(pq2_prefill_s4_128x128x256_ldm_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+                CUDA_CHECK(cudaFuncSetAttribute(pq2_prefill_s4_128x128x256_ldm_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+                CUDA_CHECK(cudaFuncSetAttribute(pq2_prefill_s4_128x128x256_ldm_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+            }
+            if (max_i4_b > sc_i4.cap_b) {
+                if (sc_i4.B_i4) { CUDA_CHECK(cudaFree(sc_i4.B_i4)); }
+                CUDA_CHECK(cudaMalloc(&sc_i4.B_i4, max_i4_b));
+                sc_i4.cap_b = max_i4_b; sc_i4.valid = false;
+            }
+            if (max_i4_sc > sc_i4.cap_sc) {
+                if (sc_i4.B_scales) { CUDA_CHECK(cudaFree(sc_i4.B_scales)); }
+                CUDA_CHECK(cudaMalloc(&sc_i4.B_scales, max_i4_sc));
+                sc_i4.cap_sc = max_i4_sc; sc_i4.valid = false;
+            }
+            if (max_i4_gate > sc_i4.cap_gate) {
+                if (sc_i4.gate_f16) { CUDA_CHECK(cudaFree(sc_i4.gate_f16)); }
+                CUDA_CHECK(cudaMalloc(&sc_i4.gate_f16, max_i4_gate));
+                sc_i4.cap_gate = max_i4_gate;
+            }
+            if (max_cb_b > sc_cb.B_i8_cap) {
+                if (sc_cb.B_i8) { CUDA_CHECK(cudaFree(sc_cb.B_i8)); }
+                CUDA_CHECK(cudaMalloc(&sc_cb.B_i8, max_cb_b));
+                sc_cb.B_i8_cap = max_cb_b; sc_cb.valid = false;
+            }
+            if (max_cb_sc > sc_cb.col_scales_cap) {
+                if (sc_cb.col_scales) { CUDA_CHECK(cudaFree(sc_cb.col_scales)); }
+                CUDA_CHECK(cudaMalloc(&sc_cb.col_scales, max_cb_sc));
+                sc_cb.col_scales_cap = max_cb_sc; sc_cb.valid = false;
             }
         }
         // Start CUDA graph capture

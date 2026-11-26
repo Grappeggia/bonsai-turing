@@ -69,7 +69,8 @@ struct common_mtp_draft_timing {
         total += std::chrono::duration<double, std::milli>(t - t0).count();
         calls++;
         chain_calls += chain;
-        if (calls == 64) {
+        static const int report_every = std::getenv("LLAMA_SRV_TIMING") ? 16 : 64;
+        if (calls == report_every) {
             fprintf(stderr, "mtp-draft-timing: %d calls (%d chained), per call: total %.3f ms = pre %.3f + batch %.3f + "
                     "decode %.3f (%.2f llama_decode) + wait/readback %.3f + rest %.3f\n", calls, chain_calls, total / calls,
                     pre / calls, batch / calls, decode / calls, (double) decodes / calls, wait / calls, rest / calls);

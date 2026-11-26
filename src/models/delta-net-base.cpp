@@ -587,6 +587,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             : ggml_view_3d(ctx0, ssm_states_all, R * (K - 1), 2, mem_size, rec_size, row_size,
                     (size_t) mem_size * row_size);
 
+        ggml_tensor * wrow_dev = nullptr;
+        if (n_seqs > 1) {
+            wrow_dev = ggml_cont(ctx0, inp->s_rpl_wrow);
+            ggml_build_forward_expand(gf, wrow_dev);
+        }
+
         ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, rec, inp->s_rpl_ctrl, (int) K);
         res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
 
@@ -616,7 +622,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_build_forward_expand(gf, ggml_set_rows(ctx0,
                     ggml_view_2d(ctx0, ssm_states_all, R * (K - 1), 2, rec_size, (size_t) (mem_size + kv_head + si) * row_size),
                     ggml_view_2d(ctx0, gdn_out, R * (K - 1), 1, rec_size, rec_off + (size_t) si * rec_size),
-                    ggml_view_1d(ctx0, inp->s_rpl_wrow, 1, (size_t) si * sizeof(int64_t))));
+                    ggml_view_1d(ctx0, wrow_dev, 1, (size_t) si * sizeof(int64_t))));
             }
         }
 
