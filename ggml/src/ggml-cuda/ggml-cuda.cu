@@ -1784,7 +1784,11 @@ static pq2_tc_i8_entry get_or_repack_pq2_tc_i8(
     const size_t  need_qs = (size_t) n_rg * (size_t) n_kblk * 32 * sizeof(uint2);
     const size_t  need_d  = (size_t) n_rg * (size_t) n_kblk * 8  * sizeof(half);
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need_qs + need_d + (2ULL << 30)) {
+    static const size_t tc_headroom = []() -> size_t {
+        const char * v = getenv("GGML_CUDA_PQ2_HEADROOM_MB");
+        return v ? (size_t) std::max(256L, atol(v)) << 20 : (2ULL << 30);
+    }();
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need_qs + need_d + tc_headroom) {
         return {};
     }
     pq2_tc_i8_entry e;
@@ -2741,7 +2745,11 @@ static pq2_s4_rm_entry get_or_repack_pq2_s4_rm(
     const size_t need_qs = (size_t) M * (size_t) (K >> 1);
     const size_t need_d  = (size_t) M * sizeof(float);
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need_qs + need_d + (3584ULL << 20)) {
+    static const size_t s4_headroom = []() -> size_t {
+        const char * v = getenv("GGML_CUDA_PQ2_HEADROOM_MB");
+        return v ? (size_t) std::max(256L, atol(v)) << 20 : (3584ULL << 20);
+    }();
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < need_qs + need_d + s4_headroom) {
         return {};
     }
     pq2_s4_rm_entry e;
@@ -10002,6 +10010,85 @@ static void ggml_cuda_norm_fwht_q8_register(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// Iter 92: Fused low-rank F32 LoRA (MUL_MAT(lora_a) -> MUL_MAT(lora_b) -> SCALE -> ADD(res))
+// Eliminates 256 tiny cuBLAS/MMQ calls + 256 full [M, N] SCALE/ADD DRAM round-trips per forward pass.
+__global__ static void fused_lora_a_dot_scale_kernel(
+        const float * __restrict__ lora_a, // [K, R]
+        const float * __restrict__ cur,    // [K, N]
+        float       * __restrict__ h_out,  // [R, N]
+        const int K, const int R, const float scale) {
+    const int n = blockIdx.x;
+    const int r = blockIdx.y;
+    const int K4 = K >> 2;
+    const float4 * a4 = (const float4 *) (lora_a + (int64_t) r * K);
+    const float4 * x4 = (const float4 *) (cur    + (int64_t) n * K);
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < K4; i += blockDim.x) {
+        const float4 av = __ldg(a4 + i);
+        const float4 xv = x4[i];
+        sum = fmaf(av.x, xv.x, sum);
+        sum = fmaf(av.y, xv.y, sum);
+        sum = fmaf(av.z, xv.z, sum);
+        sum = fmaf(av.w, xv.w, sum);
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, off);
+    }
+    __shared__ float smem[8];
+    if (lane == 0) { smem[warp] = sum; }
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < (blockDim.x >> 5)) ? smem[lane] : 0.0f;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) {
+            h_out[(int64_t) n * R + r] = v * scale;
+        }
+    }
+}
+
+__global__ static void fused_lora_b_add_r1_kernel(
+        const float * __restrict__ lora_b, // [1, M] contiguous
+        const float * __restrict__ h,      // [1, N]
+        const float * __restrict__ res,    // [M, N]
+        float       * __restrict__ out,    // [M, N]
+        const int M4) {
+    const int m4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m4 >= M4) { return; }
+    const int n = blockIdx.y;
+    const float hn = h[n];
+    const float4 bv = __ldg(((const float4 *) lora_b) + m4);
+    const int64_t off = (int64_t) n * M4 + m4;
+    const float4 rv = ((const float4 *) res)[off];
+    ((float4 *) out)[off] = make_float4(
+        fmaf(bv.x, hn, rv.x), fmaf(bv.y, hn, rv.y),
+        fmaf(bv.z, hn, rv.z), fmaf(bv.w, hn, rv.w));
+}
+
+__global__ static void fused_lora_b_add_rn_kernel(
+        const float * __restrict__ lora_b, // [R, M]
+        const float * __restrict__ h,      // [R, N]
+        const float * __restrict__ res,    // [M, N]
+        float       * __restrict__ out,    // [M, N]
+        const int M, const int R) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) { return; }
+    const int n = blockIdx.y;
+    const int64_t off = (int64_t) n * M + m;
+    float acc = res[off];
+    const float * b_row = lora_b + (int64_t) m * R;
+    const float * h_col = h + (int64_t) n * R;
+    for (int r = 0; r < R; ++r) {
+        acc = fmaf(__ldg(b_row + r), h_col[r], acc);
+    }
+    out[off] = acc;
+}
+
 struct ggml_cuda_tail_verify_entry {
     float * scratch; int tag;
     // q8_1 check of the attn_norm output (GGML_CUDA_TAIL_FUSION=3): the fused rows and a scratch for the reference quantize
@@ -10166,6 +10253,81 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (batched_cpy) {
             if (const int n = ggml_cuda_try_batched_cpy(cuda_ctx, cgraph, i)) {
                 return n;
+            }
+        }
+    }
+
+    // Iter 92: Fused low-rank F32 LoRA: MUL_MAT(lora_a) -> MUL_MAT(lora_b) -> SCALE -> ADD(res)
+    if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes) {
+        static const bool fuse_lora_enabled = []() {
+            const char * v = getenv("GGML_CUDA_FUSE_LORA");
+            return !v || atoi(v) != 0;
+        }();
+        ggml_tensor * n0 = node;
+        ggml_tensor * n1 = cgraph->nodes[i + 1];
+        ggml_tensor * n2 = cgraph->nodes[i + 2];
+        ggml_tensor * n3 = cgraph->nodes[i + 3];
+        if (fuse_lora_enabled &&
+                n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_SCALE && n3->op == GGML_OP_ADD &&
+                n1->src[1] == n0 && n2->src[0] == n1 &&
+                (n3->src[0] == n2 || n3->src[1] == n2)) {
+            const ggml_tensor * lora_a = n0->src[0];
+            const ggml_tensor * cur    = n0->src[1];
+            const ggml_tensor * lora_b = n1->src[0];
+            const ggml_tensor * res    = (n3->src[0] == n2) ? n3->src[1] : n3->src[0];
+            const float scale = ggml_get_op_params_f32(n2, 0);
+            const float bias  = ggml_get_op_params_f32(n2, 1);
+            if (lora_a && cur && lora_b && res && bias == 0.0f &&
+                    lora_a->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_F32 &&
+                    lora_b->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 &&
+                    n0->type == GGML_TYPE_F32 && n3->type == GGML_TYPE_F32 &&
+                    lora_a->ne[2] == 1 && lora_a->ne[3] == 1 &&
+                    cur->ne[2] == 1 && cur->ne[3] == 1 &&
+                    lora_b->ne[2] == 1 && lora_b->ne[3] == 1 &&
+                    res->ne[2] == 1 && res->ne[3] == 1 &&
+                    n3->ne[2] == 1 && n3->ne[3] == 1 &&
+                    ggml_is_contiguous(lora_a) && ggml_is_contiguous(cur) &&
+                    ggml_is_contiguous(lora_b) && ggml_is_contiguous(res) &&
+                    ggml_is_contiguous(n0) && ggml_is_contiguous(n3) &&
+                    lora_a->ne[0] == cur->ne[0] && lora_a->ne[1] == lora_b->ne[0] &&
+                    lora_b->ne[1] == res->ne[0] && res->ne[0] == n3->ne[0] &&
+                    cur->ne[1] == res->ne[1] && res->ne[1] == n3->ne[1] &&
+                    lora_a->ne[1] >= 1 && lora_a->ne[1] <= 8 &&
+                    (lora_a->ne[0] & 3) == 0 && (lora_b->ne[1] & 3) == 0 &&
+                    ggml_node_get_use_count(cgraph, i) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                    (n0->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                    (n1->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                    (n2->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) -> bool {
+                    const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+                    const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+                    return a0 < b1 && b0 < a1;
+                };
+                if (!overlaps(n0, lora_a) && !overlaps(n0, cur) && !overlaps(n0, lora_b) &&
+                        !overlaps(n0, res) && !overlaps(n0, n3) && !overlaps(n3, lora_b) &&
+                        (n3->data == res->data || !overlaps(n3, res))) {
+                    const int K = (int) lora_a->ne[0];
+                    const int R = (int) lora_a->ne[1];
+                    const int M = (int) lora_b->ne[1];
+                    const int N = (int) cur->ne[1];
+                    cudaStream_t stream = cuda_ctx->stream();
+                    fused_lora_a_dot_scale_kernel<<<dim3((unsigned) N, (unsigned) R), 256, 0, stream>>>(
+                        (const float *) lora_a->data, (const float *) cur->data, (float *) n0->data, K, R, scale);
+                    if (R == 1) {
+                        const int M4 = M >> 2;
+                        fused_lora_b_add_r1_kernel<<<dim3((unsigned) ((M4 + 255) >> 8), (unsigned) N), 256, 0, stream>>>(
+                            (const float *) lora_b->data, (const float *) n0->data,
+                            (const float *) res->data, (float *) n3->data, M4);
+                    } else {
+                        fused_lora_b_add_rn_kernel<<<dim3((unsigned) ((M + 255) >> 8), (unsigned) N), 256, 0, stream>>>(
+                            (const float *) lora_b->data, (const float *) n0->data,
+                            (const float *) res->data, (float *) n3->data, M, R);
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    return 3;
+                }
             }
         }
     }
