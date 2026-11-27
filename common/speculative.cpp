@@ -4664,7 +4664,7 @@ void common_speculative_draft(common_speculative * spec) {
         // (n_draft + 1) verify blowup and per-slot GDN recurrent checkpoints, unlocking pure batched decode.
         static const int spec_max_slots = []() {
             const char * v = getenv("LLAMA_SERVER_SPEC_MAX_SLOTS");
-            return v ? atoi(v) : 3;
+            return v ? atoi(v) : 6;
         }();
         if (n_drafting == 0 || (spec_max_slots > 0 && n_drafting > spec_max_slots)) {
             return;
