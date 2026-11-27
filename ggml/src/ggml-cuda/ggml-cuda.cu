@@ -3141,7 +3141,8 @@ __global__ static void __launch_bounds__(576, 1)
 mul_signs_fwht1024_to_s4_f16_kernel(
         const half * __restrict__ src_f16, const float * __restrict__ signs,
         uint32_t * __restrict__ dst_s4, float * __restrict__ out_col_scales,
-        const int M, const int N, const int N_pad, const int64_t s11, const float clip_sigma) {
+        const int M, const int N, const int N_pad, const int64_t s11, const float clip_sigma,
+        float * __restrict__ opt_primal_out = nullptr) {
     const int j = blockIdx.x;
     if (j >= N_pad) { return; }
     const int tid   = threadIdx.x;
@@ -3156,11 +3157,13 @@ mul_signs_fwht1024_to_s4_f16_kernel(
     }
     const half2  * in_col2 = (const half2  *) (src_f16 + (int64_t) j * s11);
     const float2 * signs2  = (const float2 *) signs;
+    float2       * pr_col2 = opt_primal_out ? ((float2 *) (opt_primal_out + (int64_t) j * s11)) : nullptr;
     float v0[16], v1[16];
 #pragma unroll
     for (int k = 0; k < 16; ++k) {
         const int idx2 = warp * 512 + k * 32 + lane;
         const float2 xf = __half22float2(in_col2[idx2]);
+        if (pr_col2) { pr_col2[idx2] = xf; }
         const float2 sf = __ldg(signs2 + idx2);
         const float x0 = xf.x * sf.x;
         const float x1 = xf.y * sf.y;
@@ -3229,7 +3232,8 @@ mul_signs_fwht1024_to_s4_f16_kernel(
 static bool ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(
         ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
         const ggml_tensor * src1, ggml_tensor * dst,
-        const ggml_tensor * fwht_signs = nullptr, const ggml_tensor * fwht_out = nullptr, int fwht_H = 0) {
+        const ggml_tensor * fwht_signs = nullptr, const ggml_tensor * fwht_out = nullptr, int fwht_H = 0,
+        bool write_primal_dst = false) {
     if (!ggml_cuda_pq2_prefill_int4_enabled()) { return false; }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!turing_mma_available(cc)) { return false; }
@@ -3321,7 +3325,8 @@ static bool ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(
         }
         mul_signs_fwht1024_to_s4_f16_kernel<<<(unsigned) N_pad, (unsigned) ((M >> 10) * 32), 0, stream>>>(
             sc.gate_f16, (const float *) fwht_signs->data, sc.B_i4, sc.B_scales,
-            (int) M, (int) N, (int) N_pad, s_dst, ggml_cuda_pq2_prefill_int4_clip());
+            (int) M, (int) N, (int) N_pad, s_dst, ggml_cuda_pq2_prefill_int4_clip(),
+            write_primal_dst ? (float *) dst->data : nullptr);
         sc.src1_data   = fwht_out->data;
         sc.src1_nbytes = ggml_nbytes(fwht_out);
         sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true;
@@ -4734,7 +4739,8 @@ __global__ static void gdn_norm_gated_fwht1024_to_i8_kernel(
         const float * __restrict__ signs,
         int8_t * __restrict__ dst_i8,
         float * __restrict__ out_col_scales,
-        const int N, const int N_pad, const int perm_nk, const int perm_rep, const float clip_sigma = 0.0f) {
+        const int N, const int N_pad, const int perm_nk, const int perm_rep, const float clip_sigma = 0.0f,
+        float * __restrict__ opt_primal_out = nullptr) {
     constexpr int M = N_BLK * 1024;
     const int j = blockIdx.x;
     if (j >= N_pad) { return; }
@@ -4751,6 +4757,7 @@ __global__ static void gdn_norm_gated_fwht1024_to_i8_kernel(
     }
     const float * s_col = src    + (int64_t) j * M;
     const float * z_col = z_gate + (int64_t) j * M;
+    float       * p_col = opt_primal_out ? (opt_primal_out + (int64_t) j * M) : nullptr;
     const int n_heads_blk = 8; // 1024 / 128 = 8 heads per warp
     float v[32];
     const int h_base = warp * n_heads_blk;
@@ -4772,10 +4779,20 @@ __global__ static void gdn_norm_gated_fwht1024_to_i8_kernel(
         const float g1 = z_col[in_base + lane + 32];
         const float g2 = z_col[in_base + lane + 64];
         const float g3 = z_col[in_base + lane + 96];
-        v[h * 4 + 0] = (x0 * irms * rms_w[lane +  0]) * (g0 / (1.0f + __expf(-g0))) * signs[out_base + lane +  0];
-        v[h * 4 + 1] = (x1 * irms * rms_w[lane + 32]) * (g1 / (1.0f + __expf(-g1))) * signs[out_base + lane + 32];
-        v[h * 4 + 2] = (x2 * irms * rms_w[lane + 64]) * (g2 / (1.0f + __expf(-g2))) * signs[out_base + lane + 64];
-        v[h * 4 + 3] = (x3 * irms * rms_w[lane + 96]) * (g3 / (1.0f + __expf(-g3))) * signs[out_base + lane + 96];
+        const float p0 = (x0 * irms * rms_w[lane +  0]) * (g0 / (1.0f + __expf(-g0)));
+        const float p1 = (x1 * irms * rms_w[lane + 32]) * (g1 / (1.0f + __expf(-g1)));
+        const float p2 = (x2 * irms * rms_w[lane + 64]) * (g2 / (1.0f + __expf(-g2)));
+        const float p3 = (x3 * irms * rms_w[lane + 96]) * (g3 / (1.0f + __expf(-g3)));
+        if (p_col) {
+            p_col[out_base + lane +  0] = p0;
+            p_col[out_base + lane + 32] = p1;
+            p_col[out_base + lane + 64] = p2;
+            p_col[out_base + lane + 96] = p3;
+        }
+        v[h * 4 + 0] = p0 * signs[out_base + lane +  0];
+        v[h * 4 + 1] = p1 * signs[out_base + lane + 32];
+        v[h * 4 + 2] = p2 * signs[out_base + lane + 64];
+        v[h * 4 + 3] = p3 * signs[out_base + lane + 96];
     }
     // 2D FWHT(1024) = H_32(in-reg) kron H_32(warp-shfl), zero smem!
 #pragma unroll
@@ -4849,7 +4866,8 @@ __global__ static void sigmoid_mul_fwht1024_to_i8_kernel(
         const float * __restrict__ signs,
         int8_t * __restrict__ dst_i8,
         float * __restrict__ out_col_scales,
-        const int N, const int N_pad, const bool strided_gate, const float clip_sigma = 0.0f) {
+        const int N, const int N_pad, const bool strided_gate, const float clip_sigma = 0.0f,
+        float * __restrict__ opt_primal_out = nullptr) {
     constexpr int M = N_BLK * 1024;
     const int j = blockIdx.x;
     if (j >= N_pad) { return; }
@@ -4866,13 +4884,16 @@ __global__ static void sigmoid_mul_fwht1024_to_i8_kernel(
     }
     const float * a_col = attn_out + (int64_t) j * M;
     const float * g_col = strided_gate ? (gate + (int64_t) j * (M * 2)) : (gate + (int64_t) j * M);
+    float       * p_col = opt_primal_out ? (opt_primal_out + (int64_t) j * M) : nullptr;
     float v[32];
 #pragma unroll
     for (int k = 0; k < 32; ++k) {
         const int idx = warp * 1024 + k * 32 + lane;
         const int g_idx = strided_gate ? (((idx >> 8) * 512) + 256 + (idx & 255)) : idx;
         const float gv = g_col[g_idx];
-        v[k] = a_col[idx] * (1.0f / (1.0f + __expf(-gv))) * signs[idx];
+        const float p = a_col[idx] * (1.0f / (1.0f + __expf(-gv)));
+        if (p_col) { p_col[idx] = p; }
+        v[k] = p * signs[idx];
     }
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
@@ -4944,7 +4965,8 @@ __global__ static void gdn_norm_gated_fwht1024_to_narrow_i8_kernel(
         const float * __restrict__ src, const float * __restrict__ rms_w, const float eps,
         const float * __restrict__ z_gate, const float * __restrict__ signs,
         uint32_t * __restrict__ dst_i8, int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
-        const int N, const int N_pad, const int perm_nk, const int perm_rep) {
+        const int N, const int N_pad, const int perm_nk, const int perm_rep,
+        float * __restrict__ opt_primal_out = nullptr) {
     constexpr int M = N_BLK * 1024;
     const int j = blockIdx.x;
     if (j >= N_pad) { return; }
@@ -4960,6 +4982,7 @@ __global__ static void gdn_norm_gated_fwht1024_to_narrow_i8_kernel(
     }
     const float * s_col = src    + (int64_t) j * M;
     const float * z_col = z_gate + (int64_t) j * M;
+    float       * p_col = opt_primal_out ? (opt_primal_out + (int64_t) j * M) : nullptr;
     float v[32];
     const int h_base = warp * 8;
 #pragma unroll
@@ -4975,10 +4998,20 @@ __global__ static void gdn_norm_gated_fwht1024_to_narrow_i8_kernel(
         const float irms = rsqrtf(ssq * (1.0f / 128.0f) + eps);
         const float g0 = z_col[in_base + lane +  0], g1 = z_col[in_base + lane + 32];
         const float g2 = z_col[in_base + lane + 64], g3 = z_col[in_base + lane + 96];
-        v[h * 4 + 0] = (x0 * irms * rms_w[lane +  0]) * __fdividef(g0, 1.0f + __expf(-g0)) * signs[out_base + lane +  0];
-        v[h * 4 + 1] = (x1 * irms * rms_w[lane + 32]) * __fdividef(g1, 1.0f + __expf(-g1)) * signs[out_base + lane + 32];
-        v[h * 4 + 2] = (x2 * irms * rms_w[lane + 64]) * __fdividef(g2, 1.0f + __expf(-g2)) * signs[out_base + lane + 64];
-        v[h * 4 + 3] = (x3 * irms * rms_w[lane + 96]) * __fdividef(g3, 1.0f + __expf(-g3)) * signs[out_base + lane + 96];
+        const float p0 = (x0 * irms * rms_w[lane +  0]) * __fdividef(g0, 1.0f + __expf(-g0));
+        const float p1 = (x1 * irms * rms_w[lane + 32]) * __fdividef(g1, 1.0f + __expf(-g1));
+        const float p2 = (x2 * irms * rms_w[lane + 64]) * __fdividef(g2, 1.0f + __expf(-g2));
+        const float p3 = (x3 * irms * rms_w[lane + 96]) * __fdividef(g3, 1.0f + __expf(-g3));
+        if (p_col) {
+            p_col[out_base + lane +  0] = p0;
+            p_col[out_base + lane + 32] = p1;
+            p_col[out_base + lane + 64] = p2;
+            p_col[out_base + lane + 96] = p3;
+        }
+        v[h * 4 + 0] = p0 * signs[out_base + lane +  0];
+        v[h * 4 + 1] = p1 * signs[out_base + lane + 32];
+        v[h * 4 + 2] = p2 * signs[out_base + lane + 64];
+        v[h * 4 + 3] = p3 * signs[out_base + lane + 96];
     }
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1)
@@ -5005,7 +5038,7 @@ __global__ static void gdn_norm_gated_fwht1024_to_narrow_i8_kernel(
 static bool ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * rms_w, float eps,
         const ggml_tensor * z_gate, const ggml_tensor * signs, const ggml_tensor * fwht_out,
-        int64_t M, int64_t N, int perm_nk, int perm_rep) {
+        int64_t M, int64_t N, int perm_nk, int perm_rep, float * opt_primal_out = nullptr) {
     if (M != 6144 && M != 4096) { return false; }
     cudaStream_t stream = ctx.stream();
     if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n()) {
@@ -5016,12 +5049,12 @@ static bool ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
             gdn_norm_gated_fwht1024_to_narrow_i8_kernel<6><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
                 (const float *) src->data, (const float *) rms_w->data, eps,
                 (const float *) z_gate->data, (const float *) signs->data,
-                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, opt_primal_out);
         } else {
             gdn_norm_gated_fwht1024_to_narrow_i8_kernel<4><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
                 (const float *) src->data, (const float *) rms_w->data, eps,
                 (const float *) z_gate->data, (const float *) signs->data,
-                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, opt_primal_out);
         }
         sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
         sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
@@ -5040,12 +5073,12 @@ static bool ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
             gdn_norm_gated_fwht1024_to_i8_kernel<6, true><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
                 (const float *) src->data, (const float *) rms_w->data, eps,
                 (const float *) z_gate->data, (const float *) signs->data,
-                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, clip);
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, clip, opt_primal_out);
         } else {
             gdn_norm_gated_fwht1024_to_i8_kernel<4, true><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
                 (const float *) src->data, (const float *) rms_w->data, eps,
                 (const float *) z_gate->data, (const float *) signs->data,
-                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, clip);
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, perm_nk, perm_rep, clip, opt_primal_out);
         }
         sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
         sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
@@ -5063,12 +5096,12 @@ static bool ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
         gdn_norm_gated_fwht1024_to_i8_kernel<6, false><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
             (const float *) src->data, (const float *) rms_w->data, eps,
             (const float *) z_gate->data, (const float *) signs->data,
-            st.B_i8, st.col_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, perm_nk, perm_rep, 0.0f, opt_primal_out);
     } else {
         gdn_norm_gated_fwht1024_to_i8_kernel<4, false><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
             (const float *) src->data, (const float *) rms_w->data, eps,
             (const float *) z_gate->data, (const float *) signs->data,
-            st.B_i8, st.col_scales, (int) N, (int) N_pad, perm_nk, perm_rep);
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, perm_nk, perm_rep, 0.0f, opt_primal_out);
     }
     st.src1_data = fwht_out->data; st.src1_nbytes = ggml_nbytes(fwht_out);
     st.N = N; st.K = M; st.s11 = M; st.valid = true;
@@ -5080,7 +5113,8 @@ template <int N_BLK>
 __global__ static void sigmoid_mul_fwht1024_to_narrow_i8_kernel(
         const float * __restrict__ attn_out, const float * __restrict__ gate, const float * __restrict__ signs,
         uint32_t * __restrict__ dst_i8, int32_t * __restrict__ dst_sum128, float * __restrict__ dst_scales128,
-        const int N, const int N_pad, const bool strided_gate) {
+        const int N, const int N_pad, const bool strided_gate,
+        float * __restrict__ opt_primal_out = nullptr) {
     constexpr int M = N_BLK * 1024;
     const int j = blockIdx.x;
     if (j >= N_pad) { return; }
@@ -5096,13 +5130,16 @@ __global__ static void sigmoid_mul_fwht1024_to_narrow_i8_kernel(
     }
     const float * a_col = attn_out + (int64_t) j * M;
     const float * g_col = gate     + (int64_t) j * (strided_gate ? (2 * M) : M);
+    float       * p_col = opt_primal_out ? (opt_primal_out + (int64_t) j * M) : nullptr;
     float v[32];
 #pragma unroll
     for (int k = 0; k < 32; ++k) {
         const int idx = warp * 1024 + k * 32 + lane;
         const int g_idx = strided_gate ? ((idx >> 8) * 512 + 256 + (idx & 255)) : idx;
         const float g = g_col[g_idx];
-        v[k] = a_col[idx] * __fdividef(1.0f, 1.0f + __expf(-g)) * __ldg(signs + idx);
+        const float p = a_col[idx] * __fdividef(1.0f, 1.0f + __expf(-g));
+        if (p_col) { p_col[idx] = p; }
+        v[k] = p * __ldg(signs + idx);
     }
 #pragma unroll
     for (int h = 1; h < 32; h <<= 1)
@@ -5128,7 +5165,8 @@ __global__ static void sigmoid_mul_fwht1024_to_narrow_i8_kernel(
 
 static bool ggml_cuda_sigmoid_mul_fwht1024_to_i8(
         ggml_backend_cuda_context & ctx, const ggml_tensor * attn_out, const ggml_tensor * gate,
-        const ggml_tensor * signs, const ggml_tensor * fwht_out, int64_t M, int64_t N, bool strided_gate) {
+        const ggml_tensor * signs, const ggml_tensor * fwht_out, int64_t M, int64_t N, bool strided_gate,
+        float * opt_primal_out = nullptr) {
     if (M != 6144 && M != 4096) { return false; }
     cudaStream_t stream = ctx.stream();
     if (ggml_cuda_pq2_narrow_int8_enabled() && N >= 5 && N <= pq2_narrow_i8_max_n()) {
@@ -5138,11 +5176,11 @@ static bool ggml_cuda_sigmoid_mul_fwht1024_to_i8(
         if (M == 6144) {
             sigmoid_mul_fwht1024_to_narrow_i8_kernel<6><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
                 (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
-                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, strided_gate);
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, strided_gate, opt_primal_out);
         } else {
             sigmoid_mul_fwht1024_to_narrow_i8_kernel<4><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
                 (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
-                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, strided_gate);
+                sc.B_i8, sc.B_sum, sc.B_scales, (int) N, (int) N_pad, strided_gate, opt_primal_out);
         }
         sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
         sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
@@ -5160,11 +5198,11 @@ static bool ggml_cuda_sigmoid_mul_fwht1024_to_i8(
         if (M == 6144) {
             sigmoid_mul_fwht1024_to_i8_kernel<6, true><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
                 (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
-                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, strided_gate, clip);
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, strided_gate, clip, opt_primal_out);
         } else {
             sigmoid_mul_fwht1024_to_i8_kernel<4, true><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
                 (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
-                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, strided_gate, clip);
+                (int8_t *) sc.B_i4, sc.B_scales, (int) N, (int) N_pad, strided_gate, clip, opt_primal_out);
         }
         sc.src1_data = fwht_out->data; sc.src1_nbytes = ggml_nbytes(fwht_out);
         sc.N = N; sc.K = M; sc.s11 = M; sc.valid = true; ++sc.gen;
@@ -5181,11 +5219,11 @@ static bool ggml_cuda_sigmoid_mul_fwht1024_to_i8(
     if (M == 6144) {
         sigmoid_mul_fwht1024_to_i8_kernel<6, false><<<(unsigned) N_pad, 6 * 32, 0, stream>>>(
             (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
-            st.B_i8, st.col_scales, (int) N, (int) N_pad, strided_gate);
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, strided_gate, 0.0f, opt_primal_out);
     } else {
         sigmoid_mul_fwht1024_to_i8_kernel<4, false><<<(unsigned) N_pad, 4 * 32, 0, stream>>>(
             (const float *) attn_out->data, (const float *) gate->data, (const float *) signs->data,
-            st.B_i8, st.col_scales, (int) N, (int) N_pad, strided_gate);
+            st.B_i8, st.col_scales, (int) N, (int) N_pad, strided_gate, 0.0f, opt_primal_out);
     }
     st.src1_data = fwht_out->data; st.src1_nbytes = ggml_nbytes(fwht_out);
     st.N = N; st.K = M; st.s11 = M; st.valid = true;
@@ -11262,11 +11300,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_tensor * fwht_mm = cgraph->nodes[i + 5];
                     const ggml_tensor * sgn = (mul_s->src[0] == glu) ? mul_s->src[1] : ((mul_s->src[1] == glu) ? mul_s->src[0] : nullptr);
                     const int H = (int) fwht_mm->src[0]->ne[0];
+                    const int glu_uses = ggml_node_get_use_count(cgraph, i + 2);
                     if (sgn && sgn->type == GGML_TYPE_F32 && ggml_is_contiguous(sgn) &&
                             sgn->ne[0] == glu->ne[0] && ggml_nrows(sgn) == 1 &&
                             rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
                             (H == 1024 || H == 512 || H == 256 || H == 128) &&
-                            ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                            glu_uses >= 1 &&
                             ggml_node_get_use_count(cgraph, i + 3) == 1 &&
                             ggml_node_get_use_count(cgraph, i + 4) == 1 &&
                             (glu->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
@@ -11291,6 +11330,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         }
                     }
                 }
+                const bool glu_extra_uses = (ggml_node_get_use_count(cgraph, i + 2) > 1);
                 int j_next = i + 3;
                 while (j_next < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j_next])) {
                     ++j_next;
@@ -11301,14 +11341,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     cgraph->nodes[j_next]->src[0]->type == GGML_TYPE_PQ2_0 &&
                     ggml_node_get_use_count(cgraph, i + 2) == 1 &&
                     (glu->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
-                if (ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu, fwht_signs, fwht_out, fwht_H)) {
+                if (ggml_cuda_mul_mat_pq2_prefill_int4_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu, fwht_signs, fwht_out, fwht_H, glu_extra_uses)) {
                     fused_mul_mat_vec = true;
                     fused_node_count  = 3 + ((fwht_signs && fwht_out && fwht_H == 1024 && (glu->ne[0] % 1024) == 0 && (glu->ne[0] >> 10) <= 24) ? extra_fused : 0);
                     break;
                 }
-                if (ggml_cuda_mul_mat_pq2_cublas_i8_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu, direct_b, fwht_signs, fwht_out, fwht_H)) {
+                if (ggml_cuda_mul_mat_pq2_cublas_i8_swiglu(*cuda_ctx, gate->src[0], up->src[0], src1, glu, direct_b,
+                        glu_extra_uses ? nullptr : fwht_signs, glu_extra_uses ? nullptr : fwht_out, glu_extra_uses ? 0 : fwht_H)) {
                     fused_mul_mat_vec = true;
-                    fused_node_count  = 3 + extra_fused;
+                    fused_node_count  = 3 + (glu_extra_uses ? 0 : extra_fused);
                     break;
                 }
             }
@@ -11641,7 +11682,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_is_contiguous(gate) && ggml_is_contiguous(aout) && ggml_is_contiguous(sgn) &&
                 ggml_are_same_shape(gate, aout) && sgn->ne[0] == gate->ne[0] && ggml_nrows(sgn) == 1 &&
                 rsh->src[0] == mul_s && fwht_mm->src[1] == rsh &&
-                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) >= 1 &&
                 ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
                 (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul_g->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
                 (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (fwht_mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
@@ -11660,8 +11701,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             auto it_skip = tl_skipped_gate_cont_i8.find(gate);
             const bool is_strided = (it_skip != tl_skipped_gate_cont_i8.end());
             const ggml_tensor * gate_src = is_strided ? it_skip->second : gate;
-            if (fwht_only_pq2 && ggml_cuda_sigmoid_mul_fwht1024_to_i8(
-                    *cuda_ctx, aout, gate_src, sgn, fwht_mm, gate->ne[0], gate->ne[1], is_strided)) {
+            const bool need_primal = (ggml_node_get_use_count(cgraph, i + 1) > 1);
+            const bool primal_safe = !need_primal || (mul_g->data != aout->data && mul_g->data != gate_src->data);
+            if (fwht_only_pq2 && primal_safe && ggml_cuda_sigmoid_mul_fwht1024_to_i8(
+                    *cuda_ctx, aout, gate_src, sgn, fwht_mm, gate->ne[0], gate->ne[1], is_strided,
+                    need_primal ? (float *) mul_g->data : nullptr)) {
                 if (is_strided) { tl_skipped_gate_cont_i8.erase(it_skip); }
                 return 4;
             }
@@ -11676,7 +11720,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE) {
         ggml_tensor * rms = cgraph->nodes[i]; ggml_tensor * mul_w = cgraph->nodes[i + 1];
         ggml_tensor * glu = cgraph->nodes[i + 2]; ggml_tensor * rsh1 = cgraph->nodes[i + 3];
-        int perm_nk = 1, perm_rep = 1, idx_ms = i + 4;
+        int perm_nk = 1, perm_rep = 1, idx_ms = i + 4, idx_pre_ms = i + 3;
         const ggml_tensor * pre_ms = rsh1;
         bool perm_ok = true;
         if (i + 10 < cgraph->n_nodes &&
@@ -11688,9 +11732,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     rsh_p->ne[0] == 128 && perm->ne[0] == 128 && perm->ne[1] == rsh_p->ne[2] && perm->ne[2] == rsh_p->ne[1] &&
                     rsh_p->ne[2] > 1 && rsh_p->ne[0] * rsh_p->ne[1] * rsh_p->ne[2] == rsh1->ne[0] &&
                     ggml_node_get_use_count(cgraph, i + 4) == 1 && ggml_node_get_use_count(cgraph, i + 5) == 1 &&
-                    ggml_node_get_use_count(cgraph, i + 6) == 1 && ggml_node_get_use_count(cgraph, i + 7) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 6) == 1 && ggml_node_get_use_count(cgraph, i + 7) >= 1 &&
                     (cont_p->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
-                perm_nk = (int) rsh_p->ne[1]; perm_rep = (int) rsh_p->ne[2]; pre_ms = rsh_p2; idx_ms = i + 8;
+                perm_nk = (int) rsh_p->ne[1]; perm_rep = (int) rsh_p->ne[2]; pre_ms = rsh_p2; idx_ms = i + 8; idx_pre_ms = i + 7;
             } else { perm_ok = false; }
         }
         if (perm_ok && idx_ms + 2 < cgraph->n_nodes &&
@@ -11713,7 +11757,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     rsh1->src[0] == glu && rsh2->src[0] == mul_s && fwht_mm->src[1] == rsh2 &&
                     sgn->ne[0] == rsh1->ne[0] && ggml_nrows(sgn) == 1 &&
                     ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
-                    ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                    ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+                    (perm_rep > 1 ? ggml_node_get_use_count(cgraph, i + 3) == 1 : ggml_node_get_use_count(cgraph, i + 3) >= 1) &&
                     ggml_node_get_use_count(cgraph, idx_ms) == 1 && ggml_node_get_use_count(cgraph, idx_ms + 1) == 1 &&
                     (rms->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
                     (glu->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul_s->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
@@ -11730,9 +11775,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         }
                     }
                 }
+                const bool need_primal = (ggml_node_get_use_count(cgraph, idx_pre_ms) > 1);
+                const bool primal_safe = !need_primal || (pre_ms->data != src->data && pre_ms->data != z->data);
                 float eps = 0.0f; memcpy(&eps, rms->op_params, sizeof(float));
-                if (fwht_only_pq2 && ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
-                        *cuda_ctx, src, rw, eps, z, sgn, fwht_mm, rsh1->ne[0], rsh1->ne[1], perm_nk, perm_rep)) {
+                if (fwht_only_pq2 && primal_safe && ggml_cuda_gdn_norm_gated_fwht1024_to_i8(
+                        *cuda_ctx, src, rw, eps, z, sgn, fwht_mm, rsh1->ne[0], rsh1->ne[1], perm_nk, perm_rep,
+                        need_primal ? (float *) pre_ms->data : nullptr)) {
                     return (idx_ms + 2) - i;
                 }
             }
